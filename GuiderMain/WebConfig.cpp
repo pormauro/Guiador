@@ -2,8 +2,8 @@
 #include "WebConfig.h"
 
 #include <WiFi.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
+#include <WebServer.h>
+#include <cstring>
 
 #include "Config.h"
 #include "Control.h"
@@ -11,8 +11,7 @@
 static const char *AP_SSID = "DEPROS-GUIDER";
 static const char *AP_PASS = "depros1234";
 
-static AsyncWebServer server(80);
-static AsyncWebSocket ws("/ws");
+static WebServer server(80);
 
 // Página HTML (igual a la que te generé antes)…
 static const char MAIN_PAGE[] PROGMEM = R"HTML(
@@ -98,7 +97,6 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
 
 </div>
 <script>
-let ws;
 let posEl = document.getElementById('pos');
 let tgtEl = document.getElementById('tgt');
 let curEl = document.getElementById('cur');
@@ -110,39 +108,47 @@ let dataTgt = [];
 let dataTime = [];
 let t0 = null;
 
-function connectWS(){
-  let proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
-  ws = new WebSocket(proto + location.host + '/ws');
-  ws.onopen = () => console.log('WS conectado');
-  ws.onclose = () => setTimeout(connectWS, 1000);
-  ws.onmessage = (ev) => {
-    let j = JSON.parse(ev.data);
-    if(j.type === 'status'){
-      posEl.textContent = j.pos.toFixed(2);
-      tgtEl.textContent = j.tgt.toFixed(2);
-      curEl.textContent = j.cur.toFixed(2);
-      fltEl.textContent = j.flt;
+async function fetchStatus(){
+  try{
+    let resp = await fetch('/status');
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    let j = await resp.json();
 
-      if(t0 === null) t0 = j.t;
-      let tt = j.t - t0;
+    posEl.textContent = (+j.pos).toFixed(2);
+    tgtEl.textContent = (+j.tgt).toFixed(2);
+    curEl.textContent = (+j.cur).toFixed(2);
+    fltEl.textContent = j.flt;
 
-      dataTime.push(tt);
-      dataPos.push(j.pos);
-      dataTgt.push(j.tgt);
+    if(t0 === null) t0 = j.t;
+    let tt = j.t - t0;
 
-      if(dataTime.length > MAX_POINTS){
-        dataTime.shift();
-        dataPos.shift();
-        dataTgt.shift();
-      }
-      drawPlot();
-    } else if(j.type === 'config'){
-      for(let k in j.cfg){
-        let el = document.getElementById(k);
-        if(el) el.value = j.cfg[k];
-      }
+    dataTime.push(tt);
+    dataPos.push(j.pos);
+    dataTgt.push(j.tgt);
+
+    if(dataTime.length > MAX_POINTS){
+      dataTime.shift();
+      dataPos.shift();
+      dataTgt.shift();
     }
-  };
+    drawPlot();
+  }catch(e){
+    console.error('Status error', e);
+  }
+}
+
+async function loadConfig(){
+  try{
+    let resp = await fetch('/config');
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    let cfg = await resp.json();
+    for(let k in cfg){
+      let el = document.getElementById(k);
+      if(el) el.value = cfg[k];
+    }
+  }catch(e){
+    console.error('Config error', e);
+  }
 }
 
 function drawPlot(){
@@ -183,146 +189,139 @@ function drawPlot(){
   ctx.stroke();
 }
 
-function sendConfig(){
-  if(!ws || ws.readyState !== WebSocket.OPEN) return alert("WS desconectado");
-
+async function sendConfig(){
   let form = document.getElementById("cfgForm");
   let data = {};
   for(let i=0; i<form.elements.length; i++){
     let e = form.elements[i];
     if(e.name) data[e.name] = e.value;
   }
-  ws.send(JSON.stringify({type:"set_config", cfg:data}));
+
+  try{
+    let resp = await fetch('/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(data)
+    });
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    await loadConfig();
+  }catch(e){
+    alert('Error guardando configuración: ' + e);
+  }
 }
 
-connectWS();
+loadConfig();
+setInterval(fetchStatus, 200);
 </script>
 </body>
 </html>
 )HTML";
 
-// WS events
-static void wsEvent(AsyncWebSocket *server,
-                    AsyncWebSocketClient *client,
-                    AwsEventType type,
-                    void *arg,
-                    uint8_t *data,
-                    size_t len);
-
-// Task de broadcast
-static void broadcastTask(void *pv);
+// Helpers HTTP
+static void handleRoot();
+static void handleStatus();
+static void handleConfigGet();
+static void handleConfigPost();
+static String getConfigJson();
 
 void initWiFiAndWeb() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
 
-  ws.onEvent(wsEvent);
-  server.addHandler(&ws);
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
-    req->send_P(200, "text/html", MAIN_PAGE);
-  });
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/config", HTTP_GET, handleConfigGet);
+  server.on("/config", HTTP_POST, handleConfigPost);
 
   server.begin();
-
-  xTaskCreatePinnedToCore(broadcastTask, "WSBroadcast", 4096, NULL, 1, NULL, 1);
 }
 
 void webLoop() {
-  ws.cleanupClients();
+  server.handleClient();
+}
+static void handleRoot() {
+  server.send_P(200, "text/html", MAIN_PAGE);
 }
 
-static void wsEvent(AsyncWebSocket *server,
-                    AsyncWebSocketClient *client,
-                    AwsEventType type,
-                    void *arg,
-                    uint8_t *data,
-                    size_t len)
-{
-  if(type == WS_EVT_CONNECT){
-    String msg = "{\"type\":\"config\",\"cfg\":{";
-    msg += "\"home_position_deg\":" + String(gConfig.home_position_deg) + ",";
-    msg += "\"edge_max_deg\":" + String(gConfig.edge_max_deg) + ",";
-    msg += "\"k_edge_deg_per_step\":" + String(gConfig.k_edge_deg_per_step) + ",";
-    msg += "\"edge_control_period_ms\":" + String(gConfig.edge_control_period_ms) + ",";
-    msg += "\"edge_debounce_ms\":" + String(gConfig.edge_debounce_ms) + ",";
-    msg += "\"no_paper_timeout_ms\":" + String(gConfig.no_paper_timeout_ms) + ",";
-    msg += "\"edge_saturation_timeout_ms\":" + String(gConfig.edge_saturation_timeout_ms) + ",";
-    msg += "\"pid_kp\":" + String(gConfig.pid_kp) + ",";
-    msg += "\"pid_ki\":" + String(gConfig.pid_ki) + ",";
-    msg += "\"pid_kd\":" + String(gConfig.pid_kd) + ",";
-    msg += "\"counts_per_degree\":" + String(gConfig.counts_per_degree) + ",";
-    msg += "\"soft_current_limitA\":" + String(gConfig.soft_current_limitA) + ",";
-    msg += "\"hard_current_limitA\":" + String(gConfig.hard_current_limitA) + ",";
-    msg += "\"current_adc_offset\":" + String(gConfig.current_adc_offset) + ",";
-    msg += "\"current_adc_scale\":" + String(gConfig.current_adc_scale);
-    msg += "}}";
-    client->text(msg);
-  }
-  else if(type == WS_EVT_DATA){
-    AwsFrameInfo *info = (AwsFrameInfo*)arg;
-    if(info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT){
-      String s = "";
-      s.reserve(len);
-      for(size_t i=0;i<len;i++) s += (char)data[i];
+static void handleStatus() {
+  float pos = getServoPositionDeg();
+  float tgt = getServoTargetDeg();
+  float cur = getCurrentA();
+  String flt = getFaultString();
+  uint32_t t = millis();
 
-      if(s.indexOf("\"type\":\"set_config\"") >= 0){
-        auto getVal = [&](const char* key, String cur)->String {
-          int p = s.indexOf(String("\"") + key + "\":");
-          if(p<0) return cur;
-          p += strlen(key)+3;
-          int e = s.indexOf(",", p);
-          if(e<0) e = s.indexOf("}", p);
-          return s.substring(p,e);
-        };
+  String msg = "{";
+  msg += "\"t\":" + String(t) + ",";
+  msg += "\"pos\":" + String(pos,3) + ",";
+  msg += "\"tgt\":" + String(tgt,3) + ",";
+  msg += "\"cur\":" + String(cur,3) + ",";
+  msg += "\"flt\":\"" + flt + "\"";
+  msg += "}";
 
-        gConfig.home_position_deg = getVal("home_position_deg", String(gConfig.home_position_deg)).toFloat();
-        gConfig.edge_max_deg = getVal("edge_max_deg", String(gConfig.edge_max_deg)).toFloat();
-        gConfig.k_edge_deg_per_step = getVal("k_edge_deg_per_step", String(gConfig.k_edge_deg_per_step)).toFloat();
-
-        gConfig.edge_control_period_ms = getVal("edge_control_period_ms", String(gConfig.edge_control_period_ms)).toInt();
-        gConfig.edge_debounce_ms = getVal("edge_debounce_ms", String(gConfig.edge_debounce_ms)).toInt();
-        gConfig.no_paper_timeout_ms = getVal("no_paper_timeout_ms", String(gConfig.no_paper_timeout_ms)).toInt();
-        gConfig.edge_saturation_timeout_ms = getVal("edge_saturation_timeout_ms", String(gConfig.edge_saturation_timeout_ms)).toInt();
-
-        gConfig.pid_kp = getVal("pid_kp", String(gConfig.pid_kp)).toFloat();
-        gConfig.pid_ki = getVal("pid_ki", String(gConfig.pid_ki)).toFloat();
-        gConfig.pid_kd = getVal("pid_kd", String(gConfig.pid_kd)).toFloat();
-        gConfig.counts_per_degree = getVal("counts_per_degree", String(gConfig.counts_per_degree)).toFloat();
-
-        gConfig.soft_current_limitA = getVal("soft_current_limitA", String(gConfig.soft_current_limitA)).toFloat();
-        gConfig.hard_current_limitA = getVal("hard_current_limitA", String(gConfig.hard_current_limitA)).toFloat();
-        gConfig.current_adc_offset = getVal("current_adc_offset", String(gConfig.current_adc_offset)).toInt();
-        gConfig.current_adc_scale = getVal("current_adc_scale", String(gConfig.current_adc_scale)).toFloat();
-
-        saveConfig();
-      }
-    }
-  }
+  server.send(200, "application/json", msg);
 }
 
-static void broadcastTask(void *pv) {
-  TickType_t last = xTaskGetTickCount();
-  TickType_t dt = pdMS_TO_TICKS(100);
+static String getConfigJson() {
+  String msg = "{";
+  msg += "\"home_position_deg\":" + String(gConfig.home_position_deg) + ",";
+  msg += "\"edge_max_deg\":" + String(gConfig.edge_max_deg) + ",";
+  msg += "\"k_edge_deg_per_step\":" + String(gConfig.k_edge_deg_per_step) + ",";
+  msg += "\"edge_control_period_ms\":" + String(gConfig.edge_control_period_ms) + ",";
+  msg += "\"edge_debounce_ms\":" + String(gConfig.edge_debounce_ms) + ",";
+  msg += "\"no_paper_timeout_ms\":" + String(gConfig.no_paper_timeout_ms) + ",";
+  msg += "\"edge_saturation_timeout_ms\":" + String(gConfig.edge_saturation_timeout_ms) + ",";
+  msg += "\"pid_kp\":" + String(gConfig.pid_kp) + ",";
+  msg += "\"pid_ki\":" + String(gConfig.pid_ki) + ",";
+  msg += "\"pid_kd\":" + String(gConfig.pid_kd) + ",";
+  msg += "\"counts_per_degree\":" + String(gConfig.counts_per_degree) + ",";
+  msg += "\"soft_current_limitA\":" + String(gConfig.soft_current_limitA) + ",";
+  msg += "\"hard_current_limitA\":" + String(gConfig.hard_current_limitA) + ",";
+  msg += "\"current_adc_offset\":" + String(gConfig.current_adc_offset) + ",";
+  msg += "\"current_adc_scale\":" + String(gConfig.current_adc_scale);
+  msg += "}";
+  return msg;
+}
 
-  while(1) {
-    float pos = getServoPositionDeg();
-    float tgt = getServoTargetDeg();
-    float cur = getCurrentA();
-    String flt = getFaultString();
-    uint32_t t = millis();
+static void handleConfigGet() {
+  server.send(200, "application/json", getConfigJson());
+}
 
-    String msg = "{";
-    msg += "\"type\":\"status\",";
-    msg += "\"t\":" + String(t) + ",";
-    msg += "\"pos\":" + String(pos,3) + ",";
-    msg += "\"tgt\":" + String(tgt,3) + ",";
-    msg += "\"cur\":" + String(cur,3) + ",";
-    msg += "\"flt\":\"" + flt + "\"";
-    msg += "}";
-
-    ws.textAll(msg);
-
-    vTaskDelayUntil(&last, dt);
+static void handleConfigPost() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "text/plain", "Missing body");
+    return;
   }
+
+  String s = server.arg("plain");
+
+  auto getVal = [&](const char* key, String cur)->String {
+    int p = s.indexOf(String("\"") + key + "\":");
+    if(p<0) return cur;
+    p += strlen(key)+3;
+    int e = s.indexOf(",", p);
+    if(e<0) e = s.indexOf("}", p);
+    return s.substring(p,e);
+  };
+
+  gConfig.home_position_deg = getVal("home_position_deg", String(gConfig.home_position_deg)).toFloat();
+  gConfig.edge_max_deg = getVal("edge_max_deg", String(gConfig.edge_max_deg)).toFloat();
+  gConfig.k_edge_deg_per_step = getVal("k_edge_deg_per_step", String(gConfig.k_edge_deg_per_step)).toFloat();
+
+  gConfig.edge_control_period_ms = getVal("edge_control_period_ms", String(gConfig.edge_control_period_ms)).toInt();
+  gConfig.edge_debounce_ms = getVal("edge_debounce_ms", String(gConfig.edge_debounce_ms)).toInt();
+  gConfig.no_paper_timeout_ms = getVal("no_paper_timeout_ms", String(gConfig.no_paper_timeout_ms)).toInt();
+  gConfig.edge_saturation_timeout_ms = getVal("edge_saturation_timeout_ms", String(gConfig.edge_saturation_timeout_ms)).toInt();
+
+  gConfig.pid_kp = getVal("pid_kp", String(gConfig.pid_kp)).toFloat();
+  gConfig.pid_ki = getVal("pid_ki", String(gConfig.pid_ki)).toFloat();
+  gConfig.pid_kd = getVal("pid_kd", String(gConfig.pid_kd)).toFloat();
+  gConfig.counts_per_degree = getVal("counts_per_degree", String(gConfig.counts_per_degree)).toFloat();
+
+  gConfig.soft_current_limitA = getVal("soft_current_limitA", String(gConfig.soft_current_limitA)).toFloat();
+  gConfig.hard_current_limitA = getVal("hard_current_limitA", String(gConfig.hard_current_limitA)).toFloat();
+  gConfig.current_adc_offset = getVal("current_adc_offset", String(gConfig.current_adc_offset)).toInt();
+  gConfig.current_adc_scale = getVal("current_adc_scale", String(gConfig.current_adc_scale)).toFloat();
+
+  saveConfig();
+  server.send(200, "application/json", getConfigJson());
 }
