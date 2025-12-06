@@ -2,7 +2,7 @@
 #include "Control.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include <esp32-hal-ledc.h>
+#include "driver/ledc.h"
 
 ServoState gServoState;
 GuideState gGuideState;
@@ -11,7 +11,9 @@ static const float CONTROL_PERIOD_MS = 1.0f;
 static const uint8_t PWM_CH_R = 0;
 static const uint8_t PWM_CH_L = 1;
 static const uint32_t PWM_FREQ = 20000;
-static const uint8_t PWM_BITS = 10;
+static const uint8_t PWM_RESOLUTION_BITS = 10;
+static const ledc_mode_t PWM_SPEED_MODE = LEDC_LOW_SPEED_MODE;
+static const ledc_timer_t PWM_TIMER = LEDC_TIMER_0;
 
 // Prototipos ISR
 static void IRAM_ATTR isrEncA();
@@ -31,10 +33,38 @@ void initIO() {
   digitalWrite(PIN_REN, LOW);
   digitalWrite(PIN_LEN, LOW);
 
-  ledcSetup(PWM_CH_R, PWM_FREQ, PWM_BITS);
-  ledcSetup(PWM_CH_L, PWM_FREQ, PWM_BITS);
-  ledcAttachPin(PIN_RPWM, PWM_CH_R);
-  ledcAttachPin(PIN_LPWM, PWM_CH_L);
+  const ledc_timer_config_t timerCfg = {
+    .speed_mode = PWM_SPEED_MODE,
+    .duty_resolution = (ledc_timer_bit_t)PWM_RESOLUTION_BITS,
+    .timer_num = PWM_TIMER,
+    .freq_hz = PWM_FREQ,
+    .clk_cfg = LEDC_AUTO_CLK,
+  };
+  ledc_timer_config(&timerCfg);
+
+  const ledc_channel_config_t channelCfgR = {
+    .gpio_num = PIN_RPWM,
+    .speed_mode = PWM_SPEED_MODE,
+    .channel = (ledc_channel_t)PWM_CH_R,
+    .intr_type = LEDC_INTR_DISABLE,
+    .timer_sel = PWM_TIMER,
+    .duty = 0,
+    .hpoint = 0,
+    .flags = {},
+  };
+  ledc_channel_config(&channelCfgR);
+
+  const ledc_channel_config_t channelCfgL = {
+    .gpio_num = PIN_LPWM,
+    .speed_mode = PWM_SPEED_MODE,
+    .channel = (ledc_channel_t)PWM_CH_L,
+    .intr_type = LEDC_INTR_DISABLE,
+    .timer_sel = PWM_TIMER,
+    .duty = 0,
+    .hpoint = 0,
+    .flags = {},
+  };
+  ledc_channel_config(&channelCfgL);
 
   // Encoder
   pinMode(PIN_ENC_A, INPUT_PULLUP);
@@ -86,33 +116,40 @@ static void setMotorOutput(float u) {
       gServoState.faultEdgeSaturation) {
     digitalWrite(PIN_REN, LOW);
     digitalWrite(PIN_LEN, LOW);
-    ledcWrite(PWM_CH_R, 0);
-    ledcWrite(PWM_CH_L, 0);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_R, 0);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_L, 0);
+    ledc_update_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_R);
+    ledc_update_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_L);
     return;
   }
 
   if (abs(u) < 0.01f) {
     digitalWrite(PIN_REN, LOW);
     digitalWrite(PIN_LEN, LOW);
-    ledcWrite(PWM_CH_R, 0);
-    ledcWrite(PWM_CH_L, 0);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_R, 0);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_L, 0);
+    ledc_update_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_R);
+    ledc_update_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_L);
     return;
   }
 
   u = constrain(u, -1.0f, 1.0f);
-  uint32_t pwm = abs(u) * ((1 << PWM_BITS) - 1);
+  uint32_t pwm = abs(u) * ((1 << PWM_RESOLUTION_BITS) - 1);
 
   if (u > 0) {
     digitalWrite(PIN_REN, HIGH);
     digitalWrite(PIN_LEN, LOW);
-    ledcWrite(PWM_CH_R, pwm);
-    ledcWrite(PWM_CH_L, 0);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_R, pwm);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_L, 0);
   } else {
     digitalWrite(PIN_REN, LOW);
     digitalWrite(PIN_LEN, HIGH);
-    ledcWrite(PWM_CH_R, 0);
-    ledcWrite(PWM_CH_L, pwm);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_R, 0);
+    ledc_set_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_L, pwm);
   }
+
+  ledc_update_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_R);
+  ledc_update_duty(PWM_SPEED_MODE, (ledc_channel_t)PWM_CH_L);
 }
 
 static void updateCurrentMeasurement() {
