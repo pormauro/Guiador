@@ -4,7 +4,7 @@
 #include <EEPROM.h>
 
 #define EEPROM_SIZE 512
-#define CONFIG_MAGIC 0xDEPRO5AA
+#define CONFIG_MAGIC 0xDEADB5AA
 
 struct Config {
   uint32_t magic;

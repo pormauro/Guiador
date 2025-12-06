@@ -2,6 +2,7 @@
 #include "Control.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <esp32-hal-ledc.h>
 
 ServoState gServoState;
 GuideState gGuideState;
