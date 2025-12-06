@@ -1,0 +1,58 @@
+// File: Config.cpp
+#include "Config.h"
+
+Config gConfig;
+
+static void eepromBeginOnce() {
+  static bool begun = false;
+  if (!begun) {
+    EEPROM.begin(EEPROM_SIZE);
+    begun = true;
+  }
+}
+
+void setDefaultConfig() {
+  gConfig.magic = CONFIG_MAGIC;
+
+  // GUIADOR
+  gConfig.home_position_deg           = 0.0f;
+  gConfig.edge_max_deg                = 12.0f;
+  gConfig.k_edge_deg_per_step         = 0.4f;
+  gConfig.edge_control_period_ms      = 50;
+  gConfig.edge_debounce_ms            = 100;
+  gConfig.no_paper_timeout_ms         = 300;
+  gConfig.edge_saturation_timeout_ms  = 2000;
+
+  // PID
+  gConfig.pid_kp = 2.0f;
+  gConfig.pid_ki = 0.5f;
+  gConfig.pid_kd = 0.1f;
+
+  // Corriente
+  gConfig.soft_current_limitA = 6.0f;
+  gConfig.hard_current_limitA = 8.0f;
+  gConfig.current_adc_offset  = 2048;
+  gConfig.current_adc_scale   = 0.005f;
+
+  // Encoder
+  gConfig.counts_per_degree   = 50.0f;
+
+  memset(gConfig.reserved, 0, sizeof(gConfig.reserved));
+}
+
+void loadConfig() {
+  eepromBeginOnce();
+  EEPROM.get(0, gConfig);
+
+  if (gConfig.magic != CONFIG_MAGIC) {
+    setDefaultConfig();
+    saveConfig();
+  }
+}
+
+void saveConfig() {
+  eepromBeginOnce();
+  gConfig.magic = CONFIG_MAGIC;
+  EEPROM.put(0, gConfig);
+  EEPROM.commit();
+}
