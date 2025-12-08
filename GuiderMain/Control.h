@@ -40,6 +40,7 @@ extern GuideState gGuideState;
 
 // Inicialización y tareas
 void initIO();
+void performStartupHoming();
 void initControlTasks();
 
 // Estado del servo / fallos

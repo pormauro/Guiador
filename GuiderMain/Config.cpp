@@ -37,6 +37,7 @@ void setDefaultConfig() {
 
   // Encoder
   gConfig.counts_per_degree = 50.0f;
+  gConfig.piston_max_travel_deg = 40.0f;
 }
 
 void loadConfig() {

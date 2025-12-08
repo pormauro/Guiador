@@ -31,6 +31,13 @@ static volatile float sManualCmd  = 0.0f;  // -1 .. 1
 static bool sValveState = false;
 
 // ======================
+// ESTADO DE OPERACIÓN
+// ======================
+
+static volatile bool sOperationEnabled = false;
+static float         sStartupHoldDeg   = 0.0f;
+
+// ======================
 // PROTOTIPOS INTERNOS
 // ======================
 
@@ -40,6 +47,8 @@ static void controlTask(void *pv);
 static void guideTask(void *pv);
 static void updateCurrentMeasurement();
 static void setMotorOutput(float u);
+static void moveToDegBlocking(float targetDeg, uint32_t timeoutMs);
+static void updateStartButtonState();
 
 // ======================
 // INIT IO
@@ -93,6 +102,48 @@ void initIO() {
   gGuideState.lastR = 2;
 
   Serial.println("IO OK (PWM con analogWrite).");
+}
+
+// ======================
+// SECUENCIA DE HOMING
+// ======================
+
+void performStartupHoming() {
+  Serial.println("Inicio de homing de pistón...");
+
+  // Limpia estados previos
+  gServoState.faultMagLimit = false;
+  gServoState.faultNoPaper  = false;
+  gServoState.faultEdgeSat  = false;
+  gServoState.faultOCHard   = false;
+  gServoState.faultOCSoft   = false;
+
+  // Búsqueda hacia la izquierda hasta final de carrera
+  uint32_t start = millis();
+  setMotorOutput(-0.4f);
+  while (digitalRead(PIN_LIMIT_MAG) != LOW && (millis() - start) < 6000) {
+    delay(5);
+  }
+  setMotorOutput(0.0f);
+
+  if (digitalRead(PIN_LIMIT_MAG) == LOW) {
+    Serial.println("Final de carrera detectado, fijando referencia 0.");
+    gServoState.encoderCount = 0;
+    gServoState.positionDeg  = 0.0f;
+  } else {
+    Serial.println("Advertencia: no se detectó el final de carrera (timeout).");
+    gServoState.faultMagLimit = true;
+  }
+
+  sStartupHoldDeg = gConfig.piston_max_travel_deg * 0.5f;
+  gGuideState.edgeOffsetDeg  = 0.0f;
+  gGuideState.servoTargetDeg = sStartupHoldDeg;
+
+  moveToDegBlocking(sStartupHoldDeg, 4000);
+
+  // Requiere habilitación por botón para iniciar guiador
+  sOperationEnabled = false;
+  Serial.println("Homing finalizado. Esperando pulsación de botón para operar.");
 }
 
 // ======================
@@ -204,6 +255,34 @@ static void setMotorOutput(float u) {
   }
 }
 
+static void moveToDegBlocking(float targetDeg, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while ((millis() - start) < timeoutMs) {
+    float posDeg = gServoState.encoderCount / gConfig.counts_per_degree;
+    float error  = targetDeg - posDeg;
+    if (fabs(error) < 0.2f) break;
+
+    float u = constrain(error * 0.04f, -0.6f, 0.6f);
+    setMotorOutput(u);
+    delay(10);
+  }
+  setMotorOutput(0.0f);
+}
+
+static void updateStartButtonState() {
+  static uint32_t pressedMs = 0;
+  bool pressed = (digitalRead(PIN_BUTTON) == LOW);
+
+  if (pressed) {
+    if (pressedMs < 1000) pressedMs++;
+    if (pressedMs > 50) {
+      sOperationEnabled = true;
+    }
+  } else {
+    pressedMs = 0;
+  }
+}
+
 // ======================
 // CONTROL TASK (CORE 1)
 // ======================
@@ -213,6 +292,8 @@ static void controlTask(void *pv) {
   Serial.println(xPortGetCoreID());
 
   while (true) {
+    updateStartButtonState();
+
     // Posición desde encoder
     long enc = gServoState.encoderCount;
     gServoState.positionDeg = enc / gConfig.counts_per_degree;
@@ -237,6 +318,10 @@ static void controlTask(void *pv) {
       gServoState.targetDeg = gServoState.positionDeg; // setpoint = actual (para mostrar)
       setMotorOutput(sManualCmd);
     } else {
+      if (!sOperationEnabled) {
+        gGuideState.servoTargetDeg = sStartupHoldDeg;
+      }
+
       // ---- MODO AUTOMÁTICO (PID) ----
       gServoState.targetDeg = gGuideState.servoTargetDeg;
 
@@ -285,6 +370,12 @@ static void guideTask(void *pv) {
   while (true) {
     uint32_t per = gConfig.edge_control_period_ms;
     if (per < 10) per = 10;
+
+    if (!sOperationEnabled && !sManualMode) {
+      gGuideState.servoTargetDeg = sStartupHoldDeg;
+      vTaskDelay(pdMS_TO_TICKS(per));
+      continue;
+    }
 
     uint8_t L = (digitalRead(PIN_OPT_LEFT)  == LOW);
     uint8_t R = (digitalRead(PIN_OPT_RIGHT) == LOW);
