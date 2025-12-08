@@ -1,4 +1,3 @@
-// File: Control.cpp
 #include <Arduino.h>
 #include "Control.h"
 #include "Pins.h"
@@ -8,6 +7,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "Log.h"   // Logger de eventos
+
 // ======================
 // ESTADOS GLOBALES
 // ======================
@@ -16,18 +17,25 @@ ServoState gServoState;
 GuideState gGuideState;
 
 // ======================
-// CONFIG PWM SIMPLE
+// CONFIG PWM (LEDC)
 // ======================
 
-static const uint8_t PWM_MAX = 255;
+static const uint16_t PWM_MAX      = 1023;   // 10 bits
+static const uint32_t PWM_FREQ     = 20000;  // 20 kHz
+static const uint8_t  PWM_RES_BITS = 10;     // 0..1023
 
 // ======================
-// ESTADO DE MODO MANUAL
+// ESTADO DE MODO MANUAL / AUTO
 // ======================
 
+// Modo manual: pisa TODO (PID, auto, botón)
 static volatile bool  sManualMode = false;
-static volatile float sManualCmd  = 0.0f;  // -1 .. 1
+static volatile float sManualCmd  = 0.0f;   // -1 .. 1 (mandado desde web)
 
+// Ciclo automático (solo válido cuando NO está en manual)
+static volatile bool  sAutoRun    = false;  // ON/OFF del ciclo automático
+
+// Estado del relé / válvula
 static bool sValveState = false;
 
 // ======================
@@ -46,7 +54,8 @@ static void setMotorOutput(float u);
 // ======================
 
 void initIO() {
-  Serial.println("INIT IO (sin LEDC)...");
+  Serial.println("INIT IO (LEDC + modos MANUAL/AUTO)…");
+  logEvent("INIT IO");
 
   // --- DRIVER BTS7960 ---
   pinMode(PIN_RPWM, OUTPUT);
@@ -57,8 +66,17 @@ void initIO() {
   digitalWrite(PIN_REN, LOW);
   digitalWrite(PIN_LEN, LOW);
 
-  analogWrite(PIN_RPWM, 0);
-  analogWrite(PIN_LPWM, 0);
+  // ==== NUEVA API LEDC ====
+  bool ok1 = ledcAttach(PIN_RPWM, PWM_FREQ, PWM_RES_BITS);
+  bool ok2 = ledcAttach(PIN_LPWM, PWM_FREQ, PWM_RES_BITS);
+
+  if (!ok1 || !ok2) {
+    Serial.println("ERROR: ledcAttach falló en RPWM/LPWM.");
+    logEvent("ERROR: ledcAttach fallo en RPWM/LPWM");
+  }
+
+  ledcWrite(PIN_RPWM, 0);
+  ledcWrite(PIN_LPWM, 0);
 
   // --- ENCODER ---
   pinMode(PIN_ENC_A, INPUT_PULLUP);
@@ -80,7 +98,7 @@ void initIO() {
   digitalWrite(PIN_VALVE_OUT, LOW);
   sValveState = false;
 
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);  // botón físico (LOW = pulsado)
 
   pinMode(PIN_LED_STATUS, OUTPUT);
   digitalWrite(PIN_LED_STATUS, LOW);
@@ -92,7 +110,12 @@ void initIO() {
   gGuideState.lastL = 2;
   gGuideState.lastR = 2;
 
-  Serial.println("IO OK (PWM con analogWrite).");
+  sManualMode = false;
+  sManualCmd  = 0.0f;
+  sAutoRun    = false;
+
+  logEvent("IO OK (PWM LEDC listo)");
+  Serial.println("IO OK (PWM con LEDC, modos listos).");
 }
 
 // ======================
@@ -100,7 +123,6 @@ void initIO() {
 // ======================
 
 void initControlTasks() {
-  // ControlTask → CORE 1
   xTaskCreatePinnedToCore(
     controlTask,
     "ControlTask",
@@ -111,7 +133,6 @@ void initControlTasks() {
     1
   );
 
-  // GuideTask → CORE 1
   xTaskCreatePinnedToCore(
     guideTask,
     "GuideTask",
@@ -122,6 +143,7 @@ void initControlTasks() {
     1
   );
 
+  logEvent("ControlTask y GuideTask iniciadas");
   Serial.println("Tasks running on Core 1.");
 }
 
@@ -154,55 +176,114 @@ static void updateCurrentMeasurement() {
   float I = (filt - gConfig.current_adc_offset) * gConfig.current_adc_scale;
 
   gServoState.currentA = I;
+
+  bool prevSoft = gServoState.faultOCSoft;
+  bool prevHard = gServoState.faultOCHard;
+
   gServoState.faultOCSoft = (I > gConfig.soft_current_limitA);
 
   if (I > gConfig.hard_current_limitA) {
     gServoState.faultOCHard = true;
+  } else {
+    // si baja, liberamos hard fault (si querés latch, sacá esto)
+    gServoState.faultOCHard = false;
+  }
+
+  if (!prevSoft && gServoState.faultOCSoft) {
+    logEvent("SOFT_OC: I=" + String(I, 3));
+  }
+  if (!prevHard && gServoState.faultOCHard) {
+    logEvent("HARD_OC: I=" + String(I, 3));
   }
 }
 
 // ======================
-// MOTOR BTS7960
+// MOTOR BTS7960 (LEDC)
 // ======================
-
 static void setMotorOutput(float u) {
-  bool fault =
-    gServoState.faultOCHard  ||
-    gServoState.faultMagLimit ||
-    gServoState.faultNoPaper  ||
-    gServoState.faultEdgeSat;
 
-  if (fault) {
-    digitalWrite(PIN_REN, LOW);
-    digitalWrite(PIN_LEN, LOW);
-    analogWrite(PIN_RPWM, 0);
-    analogWrite(PIN_LPWM, 0);
-    return;
+  bool fatalFault  = gServoState.faultOCHard;
+  bool normalFault = gServoState.faultMagLimit ||
+                     gServoState.faultNoPaper  ||
+                     gServoState.faultEdgeSat;
+
+  // ============================
+  // MODO MANUAL
+  // ============================
+  // En manual, SOLO cortamos por HARD_OC.
+  if (sManualMode) {
+      if (fatalFault) {
+          digitalWrite(PIN_REN, LOW);
+          digitalWrite(PIN_LEN, LOW);
+          ledcWrite(PIN_RPWM, 0);
+          ledcWrite(PIN_LPWM, 0);
+          return;
+      }
+
+      // Ignora todos los demás faults en modo manual.
+      // Control directo del motor.
+      u = constrain(u, -1.0f, 1.0f);
+      uint16_t duty = (uint16_t)(fabs(u) * PWM_MAX);
+
+      if (fabs(u) < 0.01f) {
+          digitalWrite(PIN_REN, LOW);
+          digitalWrite(PIN_LEN, LOW);
+          ledcWrite(PIN_RPWM, 0);
+          ledcWrite(PIN_LPWM, 0);
+          return;
+      }
+
+      if (u > 0) {
+          digitalWrite(PIN_REN, HIGH);
+          digitalWrite(PIN_LEN, LOW);
+          ledcWrite(PIN_RPWM, duty);
+          ledcWrite(PIN_LPWM, 0);
+      } else {
+          digitalWrite(PIN_REN, LOW);
+          digitalWrite(PIN_LEN, HIGH);
+          ledcWrite(PIN_RPWM, 0);
+          ledcWrite(PIN_LPWM, duty);
+      }
+
+      return;
   }
 
+  // ============================
+  // MODO AUTOMÁTICO (RESPETA FAULTS)
+  // ============================
+  if (fatalFault || normalFault) {
+      digitalWrite(PIN_REN, LOW);
+      digitalWrite(PIN_LEN, LOW);
+      ledcWrite(PIN_RPWM, 0);
+      ledcWrite(PIN_LPWM, 0);
+      return;
+  }
+
+  // Automático normal
   if (fabs(u) < 0.01f) {
-    digitalWrite(PIN_REN, LOW);
-    digitalWrite(PIN_LEN, LOW);
-    analogWrite(PIN_RPWM, 0);
-    analogWrite(PIN_LPWM, 0);
-    return;
+      digitalWrite(PIN_REN, LOW);
+      digitalWrite(PIN_LEN, LOW);
+      ledcWrite(PIN_RPWM, 0);
+      ledcWrite(PIN_LPWM, 0);
+      return;
   }
 
   u = constrain(u, -1.0f, 1.0f);
-  uint8_t pwm = (uint8_t)(fabs(u) * PWM_MAX);
+  uint16_t duty = (uint16_t)(fabs(u) * PWM_MAX);
 
   if (u > 0) {
-    digitalWrite(PIN_REN, HIGH);
-    digitalWrite(PIN_LEN, LOW);
-    analogWrite(PIN_RPWM, pwm);
-    analogWrite(PIN_LPWM, 0);
+      digitalWrite(PIN_REN, HIGH);
+      digitalWrite(PIN_LEN, LOW);
+      ledcWrite(PIN_RPWM, duty);
+      ledcWrite(PIN_LPWM, 0);
   } else {
-    digitalWrite(PIN_REN, LOW);
-    digitalWrite(PIN_LEN, HIGH);
-    analogWrite(PIN_RPWM, 0);
-    analogWrite(PIN_LPWM, pwm);
+      digitalWrite(PIN_REN, LOW);
+      digitalWrite(PIN_LEN, HIGH);
+      ledcWrite(PIN_RPWM, 0);
+      ledcWrite(PIN_LPWM, duty);
   }
 }
+
 
 // ======================
 // CONTROL TASK (CORE 1)
@@ -211,6 +292,15 @@ static void setMotorOutput(float u) {
 static void controlTask(void *pv) {
   Serial.print("ControlTask running on core ");
   Serial.println(xPortGetCoreID());
+  logEvent("ControlTask en core " + String(xPortGetCoreID()));
+
+  // Debounce del botón para el modo AUTOMÁTICO
+  bool     lastButtonRaw   = false;
+  bool     buttonState     = false;   // estado estable
+  uint32_t lastDebounceMs  = 0;
+
+  // Para loggear límites magnéticos una sola vez
+  bool prevMagLimit = false;
 
   while (true) {
     // Posición desde encoder
@@ -220,50 +310,107 @@ static void controlTask(void *pv) {
     // Corriente
     updateCurrentMeasurement();
 
-    // Límite magnético
-    if (digitalRead(PIN_LIMIT_MAG) == LOW) {
-      gServoState.faultMagLimit = true;
+    // Límite magnético: AHORA NO LATCH, refleja el sensor
+    bool magNow = (digitalRead(PIN_LIMIT_MAG) == LOW);
+    if (magNow != prevMagLimit) {
+      if (magNow) logEvent("MAG_LIMIT activado");
+      else        logEvent("MAG_LIMIT liberado");
+      prevMagLimit = magNow;
     }
+    gServoState.faultMagLimit = magNow;
 
-    // Fallos "duros"
-    bool blocked =
+    // Fallos (para LED / info, no para el motor directamente)
+    bool anyFault =
       gServoState.faultOCHard  ||
       gServoState.faultMagLimit ||
       gServoState.faultNoPaper  ||
       gServoState.faultEdgeSat;
 
-    if (sManualMode) {
-      // ---- MODO MANUAL ----
-      gServoState.targetDeg = gServoState.positionDeg; // setpoint = actual (para mostrar)
-      setMotorOutput(sManualCmd);
+    // ============================
+    // MANEJO DEL BOTÓN (solo AUTO)
+    // ============================
+
+    if (!sManualMode) {
+      bool raw = (digitalRead(PIN_BUTTON) == LOW);   // LOW = pulsado
+      if (raw != lastButtonRaw) {
+        lastDebounceMs = millis();
+        lastButtonRaw = raw;
+      }
+
+      if ((millis() - lastDebounceMs) > 50) {  // debounce 50 ms
+        if (raw != buttonState) {
+          buttonState = raw;
+          // Flanco de bajada: botón presionado → toggle autoRun
+          if (buttonState) {
+            sAutoRun = !sAutoRun;
+            logEvent(String("AutoRun toggled → ") + (sAutoRun ? "ON" : "OFF"));
+          }
+        }
+      }
     } else {
-      // ---- MODO AUTOMÁTICO (PID) ----
+      // En modo manual, el botón NO hace nada y el ciclo automático se apaga
+      if (sAutoRun) {
+        logEvent("AutoRun forzado OFF por MODO MANUAL");
+      }
+      sAutoRun = false;
+    }
+
+    // ============================
+    // CONTROL DEL MOTOR / MODO
+    // ============================
+
+    if (sManualMode) {
+      // ---- MODO MANUAL: pisa TODO ----
+      gServoState.targetDeg = gServoState.positionDeg;  // solo para mostrar
+      // setMotorOutput decide solo por HARD_OC
+      setMotorOutput(sManualCmd);
+
+      // Válvula en manual solo la maneja setValveOutput() (web).
+
+    } else {
+      // ---- MODO AUTOMÁTICO ----
       gServoState.targetDeg = gGuideState.servoTargetDeg;
+
+      // Manejo de válvula / relé en automático:
+      // AutoRun ON → válvula ON (relé activado, baja válvula)
+      // AutoRun OFF → válvula OFF
+      setValveOutput(sAutoRun);
 
       float error = gServoState.targetDeg - gServoState.positionDeg;
 
-      if (!blocked) {
+      if (!anyFault && sAutoRun) {
+        // PID activo solo si:
+        // - no hay fallos
+        // - AutoRun está ON
         gServoState.pidIntegral += error * 0.001f;
-        gServoState.pidIntegral = constrain(gServoState.pidIntegral, -100.0f, 100.0f);
+        gServoState.pidIntegral =
+          constrain(gServoState.pidIntegral, -100.0f, 100.0f);
+
+        float d = error - gServoState.pidLastError;
+        gServoState.pidLastError = error;
+
+        float u =
+          gConfig.pid_kp * error +
+          gConfig.pid_ki * gServoState.pidIntegral +
+          gConfig.pid_kd * d;
+
+        setMotorOutput(u / 100.0f);
+      } else {
+        // Auto OFF o fallo → motor parado
+        gServoState.pidLastError = 0.0f;
+        setMotorOutput(0.0f);
       }
-
-      float d = error - gServoState.pidLastError;
-      gServoState.pidLastError = error;
-
-      float u =
-        gConfig.pid_kp * error +
-        gConfig.pid_ki * gServoState.pidIntegral +
-        gConfig.pid_kd * d;
-
-      setMotorOutput(u / 100.0f);
     }
 
-    // Indicador LED si hay fallo mayor
+    // ============================
+    // LED de estado
+    // ============================
+
     static uint32_t ledMs = 0;
     ledMs += 1;
     if (ledMs >= 200) {
       ledMs = 0;
-      if (blocked)
+      if (anyFault)
         digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS));
       else
         digitalWrite(PIN_LED_STATUS, LOW);
@@ -281,6 +428,7 @@ static void controlTask(void *pv) {
 static void guideTask(void *pv) {
   Serial.print("GuideTask running on core ");
   Serial.println(xPortGetCoreID());
+  logEvent("GuideTask en core " + String(xPortGetCoreID()));
 
   while (true) {
     uint32_t per = gConfig.edge_control_period_ms;
@@ -302,10 +450,17 @@ static void guideTask(void *pv) {
       if (!L && !R) {
         // sin papel
         gGuideState.noPaperTimeMs += per;
-        if (gGuideState.noPaperTimeMs >= gConfig.no_paper_timeout_ms)
+        if (gGuideState.noPaperTimeMs >= gConfig.no_paper_timeout_ms) {
+          if (!gServoState.faultNoPaper) {
+            logEvent("NO_PAPER fault activado");
+          }
           gServoState.faultNoPaper = true;
+        }
       } else {
         // con papel
+        if (gServoState.faultNoPaper) {
+          logEvent("NO_PAPER fault limpiado");
+        }
         gGuideState.noPaperTimeMs = 0;
         gServoState.faultNoPaper = false;
 
@@ -320,7 +475,8 @@ static void guideTask(void *pv) {
 
         gGuideState.edgeOffsetDeg =
           constrain(gGuideState.edgeOffsetDeg,
-                    -gConfig.edge_max_deg, gConfig.edge_max_deg);
+                    -gConfig.edge_max_deg,
+                    gConfig.edge_max_deg);
       }
     }
 
@@ -360,9 +516,21 @@ String getFaultString() {
 
 void setManualMode(bool enabled) {
   sManualMode = enabled;
-  if (!enabled) {
+
+  if (enabled) {
+    // Al entrar en manual: apagar auto, motor y relé
+    sAutoRun   = false;
     sManualCmd = 0.0f;
     setMotorOutput(0.0f);
+    setValveOutput(false);
+    logEvent("MANUAL MODE: ON (autoRun OFF, motor OFF, valve OFF)");
+  } else {
+    // Al salir de manual: dejar todo en estado seguro (auto OFF)
+    sManualCmd = 0.0f;
+    sAutoRun   = false;
+    setMotorOutput(0.0f);
+    setValveOutput(false);
+    logEvent("MANUAL MODE: OFF (autoRun OFF, motor OFF, valve OFF)");
   }
 }
 
@@ -373,6 +541,7 @@ bool getManualMode() {
 void setManualCommand(float cmd) {
   cmd = constrain(cmd, -1.0f, 1.0f);
   sManualCmd = cmd;
+  logEvent("Manual CMD=" + String(cmd, 3));
 }
 
 void setValveOutput(bool on) {

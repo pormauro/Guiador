@@ -1,10 +1,10 @@
-// File: WebConfig.cpp
 #include "WebConfig.h"
 #include <WiFi.h>
 #include <WebServer.h>
 
 #include "Config.h"
 #include "Control.h"
+#include "Log.h"
 
 // --------- CONFIG WIFI AP ---------
 static const char *AP_SSID = "DEPROS-GUIDER";
@@ -44,6 +44,20 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
 .io-on{background:#c8e6c9;border-color:#2e7d32;color:#1b5e20;}
 .io-off{background:#ffcdd2;border-color:#c62828;color:#b71c1c;}
 .switch-row{display:flex;align-items:center;gap:6px;margin-top:4px;}
+#logBox{
+  width:100%;
+  min-height:200px;
+  max-height:300px;
+  border:1px solid #ccc;
+  border-radius:4px;
+  padding:6px;
+  font-size:11px;
+  font-family:monospace;
+  background:#111;
+  color:#0f0;
+  overflow-y:auto;
+  white-space:pre-wrap;
+}
 </style>
 </head>
 <body>
@@ -90,6 +104,11 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
     <div class="flex-row">
       <button type="button" onclick="toggleValve()">Toggle válvula</button>
     </div>
+
+    <h2>Log de eventos</h2>
+    <div id="logBox"></div>
+    <button type="button" onclick="clearLog()">Limpiar log</button>
+
   </div>
 
   <div class="col">
@@ -149,6 +168,8 @@ let ioOptL=document.getElementById('io_optL');
 let ioOptR=document.getElementById('io_optR');
 let ioLimit=document.getElementById('io_limit');
 let ioButton=document.getElementById('io_button');
+
+let logBox=document.getElementById('logBox');
 
 let valveState = 0;
 
@@ -210,6 +231,23 @@ function fetchIOStatus(){
     valveLabel.textContent = io.valve ? 'ON' : 'OFF';
     manualModeCheckbox.checked = (io.manual === 1);
   }).catch(e=>console.log(e));
+}
+
+function fetchLog(){
+  fetch('/log').then(r=>r.json()).then(data=>{
+    if(!data || !data.log) return;
+    logBox.textContent = data.log.join('\\n');
+    logBox.scrollTop = logBox.scrollHeight;
+  }).catch(e=>console.log(e));
+}
+
+function clearLog(){
+  fetch('/clear_log',{method:'POST'})
+    .then(r=>r.text()).then(t=>{
+      console.log('clear_log resp',t);
+      logBox.textContent="";
+    })
+    .catch(e=>console.log(e));
 }
 
 function setIoPill(elem, on){
@@ -301,6 +339,7 @@ window.onload=function(){
   fetchConfig();
   setInterval(fetchStatus,200);
   setInterval(fetchIOStatus,300);
+  setInterval(fetchLog,1000);
 };
 </script>
 </body>
@@ -382,6 +421,7 @@ static void handleConfigPost() {
   gConfig.current_adc_scale          = getArgFloat("current_adc_scale",          gConfig.current_adc_scale);
 
   saveConfig();
+  logEvent("Config guardada via /setConfig");
   server.send(200, "text/plain", "OK");
 }
 
@@ -407,6 +447,7 @@ static void handleManual() {
     String m = server.arg("mode");
     bool enabled = (m == "1" || m == "true" || m == "on");
     setManualMode(enabled);
+    logEvent(String("Manual MODE via /manual = ") + (enabled ? "ON" : "OFF"));
   }
 
   if (server.hasArg("cmd")) {
@@ -417,6 +458,7 @@ static void handleManual() {
     else if (c == "stop") v =  0.0f;
     else                  v = c.toFloat();
     setManualCommand(v);
+    logEvent("Manual CMD via /manual: " + c + " (v=" + String(v,3) + ")");
   }
 
   server.send(200, "text/plain", "OK");
@@ -427,7 +469,21 @@ static void handleValve() {
     String s = server.arg("state");
     bool on = (s == "1" || s == "true" || s == "on");
     setValveOutput(on);
+    logEvent(String("Valve via /valve = ") + (on ? "ON" : "OFF"));
   }
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleLog() {
+  String arr;
+  getLogJson(arr);
+  String json = "{\"log\":" + arr + "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleClearLog() {
+  clearLog();
+  logEvent("LOG limpiado via /clear_log");
   server.send(200, "text/plain", "OK");
 }
 
@@ -444,6 +500,7 @@ void initWiFiAndWeb() {
   IPAddress ip = WiFi.softAPIP();
   Serial.print("AP IP: ");
   Serial.println(ip);
+  logEvent("WiFi AP iniciado, IP=" + ip.toString());
 
   server.on("/",           HTTP_GET,  handleRoot);
   server.on("/status",     HTTP_GET,  handleStatus);
@@ -452,10 +509,13 @@ void initWiFiAndWeb() {
   server.on("/io_status",  HTTP_GET,  handleIOStatus);
   server.on("/manual",     HTTP_POST, handleManual);
   server.on("/valve",      HTTP_POST, handleValve);
+  server.on("/log",        HTTP_GET,  handleLog);
+  server.on("/clear_log",  HTTP_POST, handleClearLog);
   server.onNotFound(handleNotFound);
 
   server.begin();
   Serial.println("HTTP server started");
+  logEvent("HTTP server started");
 }
 
 void webLoop() {
