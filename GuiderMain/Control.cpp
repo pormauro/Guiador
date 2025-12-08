@@ -22,6 +22,15 @@ GuideState gGuideState;
 static const uint8_t PWM_MAX = 255;
 
 // ======================
+// ESTADO DE MODO MANUAL
+// ======================
+
+static volatile bool  sManualMode = false;
+static volatile float sManualCmd  = 0.0f;  // -1 .. 1
+
+static bool sValveState = false;
+
+// ======================
 // PROTOTIPOS INTERNOS
 // ======================
 
@@ -48,7 +57,6 @@ void initIO() {
   digitalWrite(PIN_REN, LOW);
   digitalWrite(PIN_LEN, LOW);
 
-  // PWM inicial
   analogWrite(PIN_RPWM, 0);
   analogWrite(PIN_LPWM, 0);
 
@@ -67,9 +75,10 @@ void initIO() {
   pinMode(PIN_OPT_RIGHT, INPUT_PULLUP);
   pinMode(PIN_LIMIT_MAG, INPUT_PULLUP);
 
-  // --- SALIDAS ---
+  // --- SALIDAS / BOTÓN / LED ---
   pinMode(PIN_VALVE_OUT, OUTPUT);
   digitalWrite(PIN_VALVE_OUT, LOW);
+  sValveState = false;
 
   pinMode(PIN_BUTTON, INPUT_PULLUP);
 
@@ -204,52 +213,60 @@ static void controlTask(void *pv) {
   Serial.println(xPortGetCoreID());
 
   while (true) {
-
+    // Posición desde encoder
     long enc = gServoState.encoderCount;
     gServoState.positionDeg = enc / gConfig.counts_per_degree;
 
+    // Corriente
     updateCurrentMeasurement();
 
-    if (digitalRead(PIN_LIMIT_MAG) == LOW)
+    // Límite magnético
+    if (digitalRead(PIN_LIMIT_MAG) == LOW) {
       gServoState.faultMagLimit = true;
-
-    gServoState.targetDeg = gGuideState.servoTargetDeg;
-
-    float error = gServoState.targetDeg - gServoState.positionDeg;
-
-    bool blocked =
-      gServoState.faultOCHard ||
-      gServoState.faultMagLimit ||
-      gServoState.faultNoPaper ||
-      gServoState.faultEdgeSat;
-
-    if (!blocked) {
-      gServoState.pidIntegral += error * 0.001f;
-      gServoState.pidIntegral = constrain(gServoState.pidIntegral, -100.0f, 100.0f);
     }
 
-    float d = error - gServoState.pidLastError;
-    gServoState.pidLastError = error;
+    // Fallos "duros"
+    bool blocked =
+      gServoState.faultOCHard  ||
+      gServoState.faultMagLimit ||
+      gServoState.faultNoPaper  ||
+      gServoState.faultEdgeSat;
 
-    float u =
-      gConfig.pid_kp * error +
-      gConfig.pid_ki * gServoState.pidIntegral +
-      gConfig.pid_kd * d;
+    if (sManualMode) {
+      // ---- MODO MANUAL ----
+      gServoState.targetDeg = gServoState.positionDeg; // setpoint = actual (para mostrar)
+      setMotorOutput(sManualCmd);
+    } else {
+      // ---- MODO AUTOMÁTICO (PID) ----
+      gServoState.targetDeg = gGuideState.servoTargetDeg;
 
-    setMotorOutput(u / 100.0f);
+      float error = gServoState.targetDeg - gServoState.positionDeg;
+
+      if (!blocked) {
+        gServoState.pidIntegral += error * 0.001f;
+        gServoState.pidIntegral = constrain(gServoState.pidIntegral, -100.0f, 100.0f);
+      }
+
+      float d = error - gServoState.pidLastError;
+      gServoState.pidLastError = error;
+
+      float u =
+        gConfig.pid_kp * error +
+        gConfig.pid_ki * gServoState.pidIntegral +
+        gConfig.pid_kd * d;
+
+      setMotorOutput(u / 100.0f);
+    }
 
     // Indicador LED si hay fallo mayor
     static uint32_t ledMs = 0;
     ledMs += 1;
     if (ledMs >= 200) {
       ledMs = 0;
-
-      if (blocked) {
-        // Toggle LED correctamente
+      if (blocked)
         digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS));
-      } else {
+      else
         digitalWrite(PIN_LED_STATUS, LOW);
-      }
     }
 
     // Evita watchdog
@@ -266,7 +283,6 @@ static void guideTask(void *pv) {
   Serial.println(xPortGetCoreID());
 
   while (true) {
-
     uint32_t per = gConfig.edge_control_period_ms;
     if (per < 10) per = 10;
 
@@ -316,7 +332,7 @@ static void guideTask(void *pv) {
 }
 
 // ======================
-// HELPERS
+// HELPERS PÚBLICOS
 // ======================
 
 float getServoPositionDeg() { return gServoState.positionDeg; }
@@ -338,4 +354,39 @@ String getFaultString() {
   if (gServoState.faultEdgeSat)  s += "EDGE_SAT;";
   if (!s.length()) s = "OK";
   return s;
+}
+
+// ---- MODO MANUAL / MANTENIMIENTO ----
+
+void setManualMode(bool enabled) {
+  sManualMode = enabled;
+  if (!enabled) {
+    sManualCmd = 0.0f;
+    setMotorOutput(0.0f);
+  }
+}
+
+bool getManualMode() {
+  return sManualMode;
+}
+
+void setManualCommand(float cmd) {
+  cmd = constrain(cmd, -1.0f, 1.0f);
+  sManualCmd = cmd;
+}
+
+void setValveOutput(bool on) {
+  sValveState = on;
+  digitalWrite(PIN_VALVE_OUT, on ? HIGH : LOW);
+}
+
+bool getValveOutput() {
+  return sValveState;
+}
+
+void getInputsStatus(bool &optL, bool &optR, bool &limitMag, bool &button) {
+  optL     = (digitalRead(PIN_OPT_LEFT)  == LOW);
+  optR     = (digitalRead(PIN_OPT_RIGHT) == LOW);
+  limitMag = (digitalRead(PIN_LIMIT_MAG) == LOW);
+  button   = (digitalRead(PIN_BUTTON)    == LOW);
 }

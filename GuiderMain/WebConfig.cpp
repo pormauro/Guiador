@@ -6,12 +6,13 @@
 #include "Config.h"
 #include "Control.h"
 
+// --------- CONFIG WIFI AP ---------
 static const char *AP_SSID = "DEPROS-GUIDER";
 static const char *AP_PASS = "depros1234";
 
 static WebServer server(80);
 
-// HTML principal en PROGMEM
+// --------- HTML PRINCIPAL ---------
 static const char MAIN_PAGE[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html>
@@ -19,19 +20,30 @@ static const char MAIN_PAGE[] PROGMEM = R"HTML(
 <meta charset="utf-8"/>
 <title>DEPROS Guider ESP32</title>
 <style>
-body{font-family:Arial;margin:0;background:#f4f4f4;}
-#wrap{max-width:1000px;margin:10px auto;background:#fff;border-radius:8px;
+body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#f4f4f4;}
+#wrap{max-width:1100px;margin:10px auto;background:#fff;border-radius:8px;
       box-shadow:0 0 10px rgba(0,0,0,0.15);padding:16px;}
 h1{margin-top:0;}
+h2,h3{margin-bottom:6px;}
 .status{background:#eee;padding:8px;border-radius:6px;font-size:14px;margin-bottom:10px;}
 .grid{display:flex;gap:16px;flex-wrap:wrap;}
-.col{flex:1;min-width:280px;}
+.col{flex:1;min-width:320px;}
 label{display:block;font-size:12px;margin-top:6px;}
-input{width:100%;padding:4px;margin-top:2px;font-size:12px;}
-button{margin-top:10px;padding:8px 16px;background:#0077cc;color:#fff;border:none;
-       border-radius:4px;cursor:pointer;font-size:13px;}
+input{width:100%;padding:4px;margin-top:2px;font-size:12px;box-sizing:border-box;}
+button{margin-top:6px;padding:6px 12px;background:#0077cc;color:#fff;border:none;
+       border-radius:4px;cursor:pointer;font-size:12px;}
 button:hover{background:#005fa3;}
 canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
+.badge{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;margin-left:4px;}
+.badge-ok{background:#c8e6c9;color:#256029;}
+.badge-warn{background:#fff9c4;color:#827717;}
+.badge-err{background:#ffcdd2;color:#b71c1c;}
+.flex-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:4px;}
+.io-pill{display:inline-block;padding:3px 8px;border-radius:12px;font-size:11px;
+         border:1px solid #ccc;margin:2px 4px 0 0;}
+.io-on{background:#c8e6c9;border-color:#2e7d32;color:#1b5e20;}
+.io-off{background:#ffcdd2;border-color:#c62828;color:#b71c1c;}
+.switch-row{display:flex;align-items:center;gap:6px;margin-top:4px;}
 </style>
 </head>
 <body>
@@ -43,12 +55,41 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
   <div>Target: <span id="tgt">0</span> °</div>
   <div>Corriente: <span id="cur">0</span> A</div>
   <div>Estado: <span id="flt">OK</span></div>
+  <div>Modo: <span id="modeLabel">AUTO</span>
+    <span id="modeBadge" class="badge badge-ok">AUTO</span>
+  </div>
+  <div>Válvula: <span id="valveLabel">OFF</span></div>
 </div>
 
 <div class="grid">
   <div class="col">
     <h2>Gráfico en vivo</h2>
     <canvas id="plot"></canvas>
+
+    <h2>Mantenimiento / Control manual</h2>
+    <div class="switch-row">
+      <input type="checkbox" id="manual_mode" onchange="onManualModeChange(this)">
+      <label for="manual_mode">Modo manual</label>
+    </div>
+
+    <div class="flex-row">
+      <button type="button" onclick="sendManualCmd('left')">◀ Izquierda</button>
+      <button type="button" onclick="sendManualCmd('stop')">■ Stop</button>
+      <button type="button" onclick="sendManualCmd('right')">Derecha ▶</button>
+    </div>
+
+    <h3>Entradas</h3>
+    <div id="io_status">
+      <span id="io_optL" class="io-pill io-off">Opt L</span>
+      <span id="io_optR" class="io-pill io-off">Opt R</span>
+      <span id="io_limit" class="io-pill io-off">Limit Mag</span>
+      <span id="io_button" class="io-pill io-off">Botón</span>
+    </div>
+
+    <h3>Válvula / Relé de salida</h3>
+    <div class="flex-row">
+      <button type="button" onclick="toggleValve()">Toggle válvula</button>
+    </div>
   </div>
 
   <div class="col">
@@ -88,7 +129,7 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
       <label>ADC offset <input name="current_adc_offset" id="current_adc_offset"/></label>
       <label>ADC scale (A/count) <input name="current_adc_scale" id="current_adc_scale"/></label>
 
-      <button type="button" onclick="sendConfig()">Guardar</button>
+      <button type="button" onclick="sendConfig()">Guardar config</button>
     </form>
   </div>
 </div>
@@ -99,6 +140,17 @@ let posEl=document.getElementById('pos');
 let tgtEl=document.getElementById('tgt');
 let curEl=document.getElementById('cur');
 let fltEl=document.getElementById('flt');
+let modeLabel=document.getElementById('modeLabel');
+let modeBadge=document.getElementById('modeBadge');
+let valveLabel=document.getElementById('valveLabel');
+let manualModeCheckbox=document.getElementById('manual_mode');
+
+let ioOptL=document.getElementById('io_optL');
+let ioOptR=document.getElementById('io_optR');
+let ioLimit=document.getElementById('io_limit');
+let ioButton=document.getElementById('io_button');
+
+let valveState = 0;
 
 const MAX_POINTS=300;
 let dataTime=[], dataPos=[], dataTgt=[];
@@ -120,6 +172,20 @@ function fetchStatus(){
     curEl.textContent=st.cur.toFixed(2);
     fltEl.textContent=st.flt;
 
+    manualModeCheckbox.checked = (st.manual === 1);
+    valveState = st.valve;
+    valveLabel.textContent = st.valve ? 'ON' : 'OFF';
+
+    if(st.manual === 1){
+      modeLabel.textContent = 'MANUAL';
+      modeBadge.textContent = 'MANUAL';
+      modeBadge.className='badge badge-warn';
+    }else{
+      modeLabel.textContent = 'AUTO';
+      modeBadge.textContent = 'AUTO';
+      modeBadge.className='badge badge-ok';
+    }
+
     let t=st.t;
     if(t0===null) t0=t;
     let tt=(t-t0)/1000.0;
@@ -132,6 +198,28 @@ function fetchStatus(){
     }
     drawPlot();
   }).catch(e=>console.log(e));
+}
+
+function fetchIOStatus(){
+  fetch('/io_status').then(r=>r.json()).then(io=>{
+    setIoPill(ioOptL, io.optL);
+    setIoPill(ioOptR, io.optR);
+    setIoPill(ioLimit, io.limitMag);
+    setIoPill(ioButton, io.button);
+    valveState = io.valve;
+    valveLabel.textContent = io.valve ? 'ON' : 'OFF';
+    manualModeCheckbox.checked = (io.manual === 1);
+  }).catch(e=>console.log(e));
+}
+
+function setIoPill(elem, on){
+  if(on){
+    elem.classList.remove('io-off');
+    elem.classList.add('io-on');
+  }else{
+    elem.classList.remove('io-on');
+    elem.classList.add('io-off');
+  }
 }
 
 function drawPlot(){
@@ -179,16 +267,48 @@ function sendConfig(){
     .catch(e=>console.log(e));
 }
 
+function onManualModeChange(chk){
+  let mode = chk.checked ? '1' : '0';
+  let params=new URLSearchParams();
+  params.append('mode', mode);
+  fetch('/manual',{method:'POST',body:params})
+    .then(r=>r.text()).then(t=>console.log('manual mode resp',t))
+    .catch(e=>console.log(e));
+}
+
+function sendManualCmd(cmd){
+  let params=new URLSearchParams();
+  params.append('cmd', cmd);
+  fetch('/manual',{method:'POST',body:params})
+    .then(r=>r.text()).then(t=>console.log('manual cmd resp',t))
+    .catch(e=>console.log(e));
+}
+
+function toggleValve(){
+  let newState = valveState ? 0 : 1;
+  let params=new URLSearchParams();
+  params.append('state', newState.toString());
+  fetch('/valve',{method:'POST',body:params})
+    .then(r=>r.text()).then(t=>{
+      console.log('valve resp',t);
+      valveState = newState;
+      valveLabel.textContent = valveState ? 'ON' : 'OFF';
+    })
+    .catch(e=>console.log(e));
+}
+
 window.onload=function(){
   fetchConfig();
   setInterval(fetchStatus,200);
+  setInterval(fetchIOStatus,300);
 };
 </script>
 </body>
 </html>
 )HTML";
 
-// helpers de parseo
+// --------- HELPERS PARAMS ---------
+
 static float getArgFloat(const String &name, float currentVal) {
   if (!server.hasArg(name)) return currentVal;
   return server.arg(name).toFloat();
@@ -202,7 +322,8 @@ static uint16_t getArgU16(const String &name, uint16_t currentVal) {
   return (uint16_t)server.arg(name).toInt();
 }
 
-// handlers
+// --------- HANDLERS ---------
+
 static void handleRoot() {
   server.send_P(200, "text/html", MAIN_PAGE);
 }
@@ -213,7 +334,9 @@ static void handleStatus() {
   json += "\"pos\":" + String(getServoPositionDeg(),3) + ",";
   json += "\"tgt\":" + String(getServoTargetDeg(),3) + ",";
   json += "\"cur\":" + String(getCurrentA(),3) + ",";
-  json += "\"flt\":\"" + getFaultString() + "\"";
+  json += "\"flt\":\"" + getFaultString() + "\",";
+  json += "\"manual\":" + String(getManualMode() ? 1 : 0) + ",";
+  json += "\"valve\":"  + String(getValveOutput() ? 1 : 0);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -262,9 +385,57 @@ static void handleConfigPost() {
   server.send(200, "text/plain", "OK");
 }
 
+static void handleIOStatus() {
+  bool optL, optR, limitMag, button;
+  getInputsStatus(optL, optR, limitMag, button);
+  bool valve  = getValveOutput();
+  bool manual = getManualMode();
+
+  String json = "{";
+  json += "\"optL\":"     + String(optL ? 1 : 0) + ",";
+  json += "\"optR\":"     + String(optR ? 1 : 0) + ",";
+  json += "\"limitMag\":" + String(limitMag ? 1 : 0) + ",";
+  json += "\"button\":"   + String(button ? 1 : 0) + ",";
+  json += "\"valve\":"    + String(valve ? 1 : 0) + ",";
+  json += "\"manual\":"   + String(manual ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleManual() {
+  if (server.hasArg("mode")) {
+    String m = server.arg("mode");
+    bool enabled = (m == "1" || m == "true" || m == "on");
+    setManualMode(enabled);
+  }
+
+  if (server.hasArg("cmd")) {
+    String c = server.arg("cmd");
+    float v = 0.0f;
+    if (c == "left")      v = -1.0f;
+    else if (c == "right")v =  1.0f;
+    else if (c == "stop") v =  0.0f;
+    else                  v = c.toFloat();
+    setManualCommand(v);
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleValve() {
+  if (server.hasArg("state")) {
+    String s = server.arg("state");
+    bool on = (s == "1" || s == "true" || s == "on");
+    setValveOutput(on);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
 static void handleNotFound() {
   server.send(404, "text/plain", "Not found");
 }
+
+// --------- INICIALIZACIÓN WIFI + WEB ---------
 
 void initWiFiAndWeb() {
   WiFi.mode(WIFI_AP);
@@ -274,10 +445,13 @@ void initWiFiAndWeb() {
   Serial.print("AP IP: ");
   Serial.println(ip);
 
-  server.on("/",         HTTP_GET,  handleRoot);
-  server.on("/status",   HTTP_GET,  handleStatus);
-  server.on("/config",   HTTP_GET,  handleConfigGet);
-  server.on("/setConfig",HTTP_POST, handleConfigPost);
+  server.on("/",           HTTP_GET,  handleRoot);
+  server.on("/status",     HTTP_GET,  handleStatus);
+  server.on("/config",     HTTP_GET,  handleConfigGet);
+  server.on("/setConfig",  HTTP_POST, handleConfigPost);
+  server.on("/io_status",  HTTP_GET,  handleIOStatus);
+  server.on("/manual",     HTTP_POST, handleManual);
+  server.on("/valve",      HTTP_POST, handleValve);
   server.onNotFound(handleNotFound);
 
   server.begin();
