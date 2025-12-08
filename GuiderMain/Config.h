@@ -31,6 +31,9 @@ struct Config {
 
   // Encoder
   float counts_per_degree;
+
+  // Recorrido máximo del pistón (en grados de encoder)
+  float piston_max_travel_deg;
 };
 
 extern Config gConfig;

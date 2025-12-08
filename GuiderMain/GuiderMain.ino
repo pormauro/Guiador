@@ -17,6 +17,9 @@ void setup() {
   // Inicializa IO (pines, encoder, sensores, etc.)
   initIO();
 
+  // Homing inicial y posicionamiento de arranque
+  performStartupHoming();
+
   // Crea tareas FreeRTOS para control y guiador
   initControlTasks();
 

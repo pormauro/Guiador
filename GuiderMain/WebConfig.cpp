@@ -104,6 +104,9 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
       <label>K_EDGE (°/step)
         <input name="k_edge_deg_per_step" id="k_edge_deg_per_step"/>
       </label>
+      <label>Recorrido máx. pistón (°)
+        <input name="piston_max_travel_deg" id="piston_max_travel_deg"/>
+      </label>
       <label>Periodo control borde (ms)
         <input name="edge_control_period_ms" id="edge_control_period_ms"/>
       </label>
@@ -346,6 +349,7 @@ static void handleConfigGet() {
   json += "\"home_position_deg\":"          + String(gConfig.home_position_deg)          + ",";
   json += "\"edge_max_deg\":"               + String(gConfig.edge_max_deg)               + ",";
   json += "\"k_edge_deg_per_step\":"        + String(gConfig.k_edge_deg_per_step)        + ",";
+  json += "\"piston_max_travel_deg\":"       + String(gConfig.piston_max_travel_deg)       + ",";
   json += "\"edge_control_period_ms\":"     + String(gConfig.edge_control_period_ms)     + ",";
   json += "\"edge_debounce_ms\":"           + String(gConfig.edge_debounce_ms)           + ",";
   json += "\"no_paper_timeout_ms\":"        + String(gConfig.no_paper_timeout_ms)        + ",";
@@ -366,6 +370,7 @@ static void handleConfigPost() {
   gConfig.home_position_deg          = getArgFloat("home_position_deg",          gConfig.home_position_deg);
   gConfig.edge_max_deg               = getArgFloat("edge_max_deg",               gConfig.edge_max_deg);
   gConfig.k_edge_deg_per_step        = getArgFloat("k_edge_deg_per_step",        gConfig.k_edge_deg_per_step);
+  gConfig.piston_max_travel_deg       = getArgFloat("piston_max_travel_deg",       gConfig.piston_max_travel_deg);
   gConfig.edge_control_period_ms     = getArgU32 ("edge_control_period_ms",      gConfig.edge_control_period_ms);
   gConfig.edge_debounce_ms           = getArgU32 ("edge_debounce_ms",            gConfig.edge_debounce_ms);
   gConfig.no_paper_timeout_ms        = getArgU32 ("no_paper_timeout_ms",         gConfig.no_paper_timeout_ms);
