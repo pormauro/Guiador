@@ -33,7 +33,7 @@ input{width:100%;padding:4px;margin-top:2px;font-size:12px;box-sizing:border-box
 button{margin-top:6px;padding:6px 12px;background:#0077cc;color:#fff;border:none;
        border-radius:4px;cursor:pointer;font-size:12px;}
 button:hover{background:#005fa3;}
-canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
+canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;display:block;}
 .badge{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;margin-left:4px;}
 .badge-ok{background:#c8e6c9;color:#256029;}
 .badge-warn{background:#fff9c4;color:#827717;}
@@ -49,6 +49,8 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
 <body>
 <div id="wrap">
 <h1>DEPROS GUIADOR ESP32</h1>
+
+<div id="data_status" class="status">Conectando...</div>
 
 <div class="status">
   <div>Posición: <span id="pos">0</span> °</div>
@@ -147,6 +149,7 @@ let modeLabel=document.getElementById('modeLabel');
 let modeBadge=document.getElementById('modeBadge');
 let valveLabel=document.getElementById('valveLabel');
 let manualModeCheckbox=document.getElementById('manual_mode');
+let dataStatus=document.getElementById('data_status');
 
 let ioOptL=document.getElementById('io_optL');
 let ioOptR=document.getElementById('io_optR');
@@ -156,24 +159,44 @@ let ioButton=document.getElementById('io_button');
 let valveState = 0;
 
 const MAX_POINTS=300;
+const PLOT_HEIGHT=250;
 let dataTime=[], dataPos=[], dataTgt=[];
 let t0=null;
 
+function setDataStatus(text, level='info'){
+  let cls='status';
+  if(level==='ok') cls+=' badge-ok';
+  else if(level==='warn') cls+=' badge-warn';
+  else if(level==='err') cls+=' badge-err';
+  dataStatus.className=cls;
+  dataStatus.textContent=text;
+}
+
 function fetchConfig(){
-  fetch('/config').then(r=>r.json()).then(cfg=>{
+  fetch('/config').then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(cfg=>{
     for(let k in cfg){
       let el=document.getElementById(k);
       if(el) el.value=cfg[k];
     }
-  }).catch(e=>console.log(e));
+  }).catch(e=>{
+    console.log(e);
+    setDataStatus('No se pudo leer configuración ('+e.message+')','warn');
+  });
 }
 
 function fetchStatus(){
-  fetch('/status').then(r=>r.json()).then(st=>{
+  fetch('/status').then(r=>{
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+  }).then(st=>{
     posEl.textContent=st.pos.toFixed(2);
     tgtEl.textContent=st.tgt.toFixed(2);
     curEl.textContent=st.cur.toFixed(2);
     fltEl.textContent=st.flt;
+    setDataStatus('Datos actualizados','ok');
 
     manualModeCheckbox.checked = (st.manual === 1);
     valveState = st.valve;
@@ -200,7 +223,10 @@ function fetchStatus(){
       dataTime.shift(); dataPos.shift(); dataTgt.shift();
     }
     drawPlot();
-  }).catch(e=>console.log(e));
+  }).catch(e=>{
+    console.log(e);
+    setDataStatus('Sin comunicación con el equipo','err');
+  });
 }
 
 function fetchIOStatus(){
@@ -230,7 +256,12 @@ function drawPlot(){
   let ctx=canvas.getContext('2d');
   let w=canvas.width, h=canvas.height;
   ctx.clearRect(0,0,w,h);
-  if(dataTime.length<2) return;
+  if(dataTime.length<2){
+    ctx.fillStyle='#777';
+    ctx.font='14px Arial';
+    ctx.fillText('Esperando datos...', 16, 24);
+    return;
+  }
 
   let tmin=dataTime[0], tmax=dataTime[dataTime.length-1];
   let ymin=Math.min(...dataPos, ...dataTgt);
@@ -256,6 +287,13 @@ function drawPlot(){
   ctx.moveTo(tx(dataTime[0]), ty(dataPos[0]));
   for(let i=1;i<dataTime.length;i++) ctx.lineTo(tx(dataTime[i]), ty(dataPos[i]));
   ctx.stroke();
+}
+
+function resizePlot(){
+  let canvas=document.getElementById('plot');
+  canvas.width=canvas.clientWidth;
+  canvas.height=PLOT_HEIGHT;
+  drawPlot();
 }
 
 function sendConfig(){
@@ -301,10 +339,12 @@ function toggleValve(){
 }
 
 window.onload=function(){
+  resizePlot();
   fetchConfig();
   setInterval(fetchStatus,200);
   setInterval(fetchIOStatus,300);
 };
+window.addEventListener('resize', resizePlot);
 </script>
 </body>
 </html>
