@@ -1,0 +1,1490 @@
+===== ARCHIVO: GuiderMain\Config.cpp =====
+// File: Config.cpp
+#include <Arduino.h>
+#include "Config.h"
+#include <math.h>
+
+Config gConfig;
+
+static void eepromInit() {
+  static bool started = false;
+  if (!started) {
+    EEPROM.begin(EEPROM_SIZE);
+    started = true;
+  }
+}
+
+static bool isFiniteFloat(float v) {
+  return !isnan(v) && !isinf(v);
+}
+
+static bool isConfigValid(const Config &c) {
+  if (c.magic != CONFIG_MAGIC) return false;
+
+  // Chequeos básicos de rango
+  if (!isFiniteFloat(c.home_position_deg))          return false;
+  if (!isFiniteFloat(c.edge_max_deg)   || c.edge_max_deg <= 0.1f || c.edge_max_deg > 90.0f) return false;
+  if (!isFiniteFloat(c.k_edge_deg_per_step) || c.k_edge_deg_per_step <= 0.0f || c.k_edge_deg_per_step > 10.0f) return false;
+
+  if (c.edge_control_period_ms < 10 || c.edge_control_period_ms > 1000) return false;
+  if (c.edge_debounce_ms < 10    || c.edge_debounce_ms > 2000) return false;
+  if (c.no_paper_timeout_ms < 50 || c.no_paper_timeout_ms > 10000) return false;
+  if (c.edge_saturation_timeout_ms < 100 || c.edge_saturation_timeout_ms > 20000) return false;
+
+  if (!isFiniteFloat(c.pid_kp) || !isFiniteFloat(c.pid_ki) || !isFiniteFloat(c.pid_kd)) return false;
+
+  if (!isFiniteFloat(c.soft_current_limitA) || c.soft_current_limitA <= 0.0f || c.soft_current_limitA > 50.0f) return false;
+  if (!isFiniteFloat(c.hard_current_limitA) || c.hard_current_limitA <= 0.0f || c.hard_current_limitA > 80.0f) return false;
+  if (c.hard_current_limitA <= c.soft_current_limitA) return false;
+
+  if (c.current_adc_offset > 4095) return false;
+  if (!isFiniteFloat(c.current_adc_scale) || c.current_adc_scale <= 0.0f || c.current_adc_scale > 0.1f) return false;
+
+  if (!isFiniteFloat(c.counts_per_degree) || c.counts_per_degree < 1.0f || c.counts_per_degree > 100000.0f) return false;
+  if (!isFiniteFloat(c.piston_max_travel_deg) || c.piston_max_travel_deg <= 0.0f || c.piston_max_travel_deg > 360.0f) return false;
+
+  return true;
+}
+
+void setDefaultConfig() {
+  gConfig.magic = CONFIG_MAGIC;
+
+  // Guiador
+  gConfig.home_position_deg          = 0.0f;
+  gConfig.edge_max_deg               = 12.0f;
+  gConfig.k_edge_deg_per_step        = 0.4f;
+  gConfig.edge_control_period_ms     = 50;
+  gConfig.edge_debounce_ms           = 100;
+  gConfig.no_paper_timeout_ms        = 300;
+  gConfig.edge_saturation_timeout_ms = 2000;
+
+  // PID
+  gConfig.pid_kp = 2.0f;
+  gConfig.pid_ki = 0.5f;
+  gConfig.pid_kd = 0.1f;
+
+  // Corriente
+  gConfig.soft_current_limitA = 6.0f;
+  gConfig.hard_current_limitA = 8.0f;
+  gConfig.current_adc_offset  = 2048;
+  gConfig.current_adc_scale   = 0.005f;  // 5 mA por cuenta aprox.
+
+  // Encoder
+  gConfig.counts_per_degree    = 50.0f;
+  gConfig.piston_max_travel_deg = 40.0f;
+}
+
+void loadConfig() {
+  eepromInit();
+  EEPROM.get(0, gConfig);
+
+  if (!isConfigValid(gConfig)) {
+    // Cualquier cosa rara en EEPROM → defaults y guardado
+    setDefaultConfig();
+    saveConfig();
+  }
+}
+
+void saveConfig() {
+  eepromInit();
+  gConfig.magic = CONFIG_MAGIC;
+  EEPROM.put(0, gConfig);
+  EEPROM.commit();
+}
+
+
+===== ARCHIVO: GuiderMain\Config.h =====
+// File: Config.h
+#pragma once
+#include <Arduino.h>
+#include <EEPROM.h>
+
+#define EEPROM_SIZE 512
+
+// IMPORTANTE: si cambiamos la estructura, cambiá el MAGIC para invalidar EEPROM vieja
+#define CONFIG_MAGIC 0xDEAD56AA   // distinto del anterior para forzar defaults una vez
+
+struct Config {
+  uint32_t magic;
+
+  // Posición y guiador
+  float    home_position_deg;
+  float    edge_max_deg;
+  float    k_edge_deg_per_step;
+  uint32_t edge_control_period_ms;
+  uint32_t edge_debounce_ms;
+  uint32_t no_paper_timeout_ms;
+  uint32_t edge_saturation_timeout_ms;
+
+  // PID
+  float pid_kp;
+  float pid_ki;
+  float pid_kd;
+
+  // Corriente
+  float    soft_current_limitA;
+  float    hard_current_limitA;
+  uint16_t current_adc_offset;
+  float    current_adc_scale;
+
+  // Encoder
+  float counts_per_degree;
+
+  // Recorrido máximo del pistón (en grados de encoder)
+  float piston_max_travel_deg;
+};
+
+extern Config gConfig;
+
+void setDefaultConfig();
+void loadConfig();
+void saveConfig();
+
+
+===== ARCHIVO: GuiderMain\Control.cpp =====
+// File: Control.cpp
+#include <Arduino.h>
+#include "Control.h"
+#include "Pins.h"
+#include "Config.h"
+
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// ======================
+// ESTADOS GLOBALES
+// ======================
+
+ServoState gServoState;
+GuideState gGuideState;
+
+// ======================
+// CONFIG PWM SIMPLE
+// ======================
+
+static const uint8_t PWM_MAX = 255;
+
+// ======================
+// ESTADO DE MODO MANUAL
+// ======================
+
+static volatile bool  sManualMode = false;
+static volatile float sManualCmd  = 0.0f;  // -1 .. 1
+
+static bool sValveState = false;
+
+// ======================
+// ESTADO DE OPERACIÓN
+// ======================
+
+static volatile bool sOperationEnabled = false;
+static float         sStartupHoldDeg   = 0.0f;
+
+// ======================
+// HELPERS INTERNOS
+// ======================
+
+static float sanitizeFloatInternal(float v,
+                                   float fallback = 0.0f,
+                                   float minV = -100000.0f,
+                                   float maxV =  100000.0f) {
+  if (isnan(v) || isinf(v)) return fallback;
+  if (v < minV) return minV;
+  if (v > maxV) return maxV;
+  return v;
+}
+
+// ======================
+// PROTOTIPOS INTERNOS
+// ======================
+
+static void IRAM_ATTR isrEncA();
+static void IRAM_ATTR isrEncB();
+static void controlTask(void *pv);
+static void guideTask(void *pv);
+static void updateCurrentMeasurement();
+static void setMotorOutput(float u);
+static void moveToDegBlocking(float targetDeg, uint32_t timeoutMs);
+static void updateStartButtonState();
+
+// ======================
+// INIT IO
+// ======================
+
+void initIO() {
+  Serial.println("INIT IO (sin LEDC)...");
+
+  // --- DRIVER BTS7960 ---
+  pinMode(PIN_RPWM, OUTPUT);
+  pinMode(PIN_LPWM, OUTPUT);
+  pinMode(PIN_REN,  OUTPUT);
+  pinMode(PIN_LEN,  OUTPUT);
+
+  digitalWrite(PIN_REN, LOW);
+  digitalWrite(PIN_LEN, LOW);
+
+  analogWrite(PIN_RPWM, 0);
+  analogWrite(PIN_LPWM, 0);
+
+  // --- ENCODER ---
+  pinMode(PIN_ENC_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_A), isrEncA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_B), isrEncB, CHANGE);
+
+  // --- SENSOR DE CORRIENTE ---
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_CURRENT_ADC, ADC_11db);
+
+  // --- SENSORES GUIADOR ---
+  pinMode(PIN_OPT_LEFT,  INPUT_PULLUP);
+  pinMode(PIN_OPT_RIGHT, INPUT_PULLUP);
+  pinMode(PIN_LIMIT_MAG, INPUT_PULLUP);
+
+  // --- SALIDAS / BOTÓN / LED ---
+  pinMode(PIN_VALVE_OUT, OUTPUT);
+  digitalWrite(PIN_VALVE_OUT, LOW);
+  sValveState = false;
+
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+
+  pinMode(PIN_LED_STATUS, OUTPUT);
+  digitalWrite(PIN_LED_STATUS, LOW);
+
+  // --- ESTADOS ---
+  memset(&gServoState, 0, sizeof(gServoState));
+  memset(&gGuideState, 0, sizeof(gGuideState));
+
+  gGuideState.lastL = 2;
+  gGuideState.lastR = 2;
+
+  gServoState.encoderCount  = 0;
+  gServoState.positionDeg   = 0.0f;
+  gServoState.targetDeg     = 0.0f;
+  gServoState.pidIntegral   = 0.0f;
+  gServoState.pidLastError  = 0.0f;
+  gServoState.currentA      = 0.0f;
+  gServoState.faultOCSoft   = false;
+  gServoState.faultOCHard   = false;
+  gServoState.faultMagLimit = false;
+  gServoState.faultNoPaper  = false;
+  gServoState.faultEdgeSat  = false;
+  gServoState.paperPresent  = false;
+
+  Serial.println("IO OK (PWM con analogWrite).");
+}
+
+// ======================
+// SECUENCIA DE HOMING
+// ======================
+
+void performStartupHoming() {
+  Serial.println("Inicio de homing de pistón...");
+
+  // Limpia estados previos
+  gServoState.faultMagLimit = false;
+  gServoState.faultNoPaper  = false;
+  gServoState.faultEdgeSat  = false;
+  gServoState.faultOCHard   = false;
+  gServoState.faultOCSoft   = false;
+
+  // Búsqueda hacia la izquierda hasta final de carrera
+  uint32_t start = millis();
+  setMotorOutput(-0.4f);
+  while (digitalRead(PIN_LIMIT_MAG) != LOW && (millis() - start) < 6000) {
+    delay(5);
+  }
+  setMotorOutput(0.0f);
+
+  if (digitalRead(PIN_LIMIT_MAG) == LOW) {
+    Serial.println("Final de carrera detectado, fijando referencia 0.");
+    gServoState.encoderCount = 0;
+    gServoState.positionDeg  = 0.0f;
+  } else {
+    Serial.println("Advertencia: no se detectó el final de carrera (timeout).");
+    gServoState.faultMagLimit = true;
+  }
+
+  sStartupHoldDeg           = gConfig.piston_max_travel_deg * 0.5f;
+  sStartupHoldDeg           = sanitizeFloatInternal(sStartupHoldDeg, 20.0f, 0.0f, gConfig.piston_max_travel_deg);
+  gGuideState.edgeOffsetDeg = 0.0f;
+  gGuideState.servoTargetDeg = sStartupHoldDeg;
+
+  moveToDegBlocking(sStartupHoldDeg, 4000);
+
+  // Requiere habilitación por botón para iniciar guiador
+  sOperationEnabled = false;
+  Serial.println("Homing finalizado. Esperando pulsación de botón para operar.");
+}
+
+// ======================
+// INIT TASKS (CORE 1)
+// ======================
+
+void initControlTasks() {
+  // ControlTask → CORE 1
+  xTaskCreatePinnedToCore(
+    controlTask,
+    "ControlTask",
+    6000,
+    nullptr,
+    2,
+    nullptr,
+    1
+  );
+
+  // GuideTask → CORE 1
+  xTaskCreatePinnedToCore(
+    guideTask,
+    "GuideTask",
+    5000,
+    nullptr,
+    1,
+    nullptr,
+    1
+  );
+
+  Serial.println("Tasks running on Core 1.");
+}
+
+// ======================
+// ISR ENCODER
+// ======================
+
+static void IRAM_ATTR isrEncA() {
+  bool A = digitalRead(PIN_ENC_A);
+  bool B = digitalRead(PIN_ENC_B);
+  gServoState.encoderCount += (A == B) ? 1 : -1;
+}
+
+static void IRAM_ATTR isrEncB() {
+  bool A = digitalRead(PIN_ENC_A);
+  bool B = digitalRead(PIN_ENC_B);
+  gServoState.encoderCount += (A != B) ? 1 : -1;
+}
+
+// ======================
+// CORRIENTE
+// ======================
+
+static void updateCurrentMeasurement() {
+  uint16_t raw = analogRead(PIN_CURRENT_ADC);
+
+  static float filt = 2048.0f;
+  filt = 0.9f * filt + 0.1f * raw;
+
+  float I = (filt - (float)gConfig.current_adc_offset) * gConfig.current_adc_scale;
+  I = sanitizeFloatInternal(I, 0.0f, -100.0f, 100.0f);
+
+  gServoState.currentA   = I;
+  gServoState.faultOCSoft = (I > gConfig.soft_current_limitA);
+
+  if (I > gConfig.hard_current_limitA) {
+    gServoState.faultOCHard = true;
+  }
+}
+
+// ======================
+// MOTOR BTS7960
+// ======================
+
+static void setMotorOutput(float u) {
+  bool fault =
+    gServoState.faultOCHard   ||
+    gServoState.faultMagLimit ||
+    gServoState.faultNoPaper  ||
+    gServoState.faultEdgeSat;
+
+  if (fault) {
+    digitalWrite(PIN_REN, LOW);
+    digitalWrite(PIN_LEN, LOW);
+    analogWrite(PIN_RPWM, 0);
+    analogWrite(PIN_LPWM, 0);
+    return;
+  }
+
+  if (fabs(u) < 0.01f) {
+    digitalWrite(PIN_REN, LOW);
+    digitalWrite(PIN_LEN, LOW);
+    analogWrite(PIN_RPWM, 0);
+    analogWrite(PIN_LPWM, 0);
+    return;
+  }
+
+  u = constrain(u, -1.0f, 1.0f);
+  uint8_t pwm = (uint8_t)(fabs(u) * PWM_MAX);
+
+  if (u > 0) {
+    digitalWrite(PIN_REN, HIGH);
+    digitalWrite(PIN_LEN, HIGH);
+    analogWrite(PIN_RPWM, pwm);
+    analogWrite(PIN_LPWM, 0);
+  } else {
+    digitalWrite(PIN_REN, HIGH);
+    digitalWrite(PIN_LEN, HIGH);
+    analogWrite(PIN_RPWM, 0);
+    analogWrite(PIN_LPWM, pwm);
+  }
+}
+
+// Mueve el pistón a un ángulo simple (sin PID completo) durante el homing
+static void moveToDegBlocking(float targetDeg, uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while ((millis() - start) < timeoutMs) {
+    float cpd = gConfig.counts_per_degree;
+    if (cpd < 1.0f || isnan(cpd) || isinf(cpd)) cpd = 50.0f;
+
+    float posDeg = (float)gServoState.encoderCount / cpd;
+    float error  = targetDeg - posDeg;
+    if (fabs(error) < 0.2f) break;
+
+    float u = constrain(error * 0.04f, -0.6f, 0.6f);
+    setMotorOutput(u);
+    delay(10);
+  }
+  setMotorOutput(0.0f);
+}
+
+static void updateStartButtonState() {
+  static bool last = true; // HIGH = no presionado (por pullup)
+  bool now = (digitalRead(PIN_BUTTON) == LOW);
+
+  // Detecta flanco descendente (presionado)
+  if (now && !last) {
+    // TOGGLE de auto
+    sOperationEnabled = !sOperationEnabled;
+
+    // Manejo del relé según modo auto
+    if (sOperationEnabled) {
+      setValveOutput(true);   // relé ON en AUTO
+    } else {
+      setValveOutput(false);  // relé OFF al salir de AUTO
+    }
+
+    Serial.printf("AUTO MODE = %d\n", sOperationEnabled);
+  }
+
+  last = now;
+}
+
+
+// ======================
+// CONTROL TASK (CORE 1)
+// ======================
+
+static void controlTask(void *pv) {
+  Serial.print("ControlTask running on core ");
+  Serial.println(xPortGetCoreID());
+
+  while (true) {
+
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      Serial.println("BOTON DETECTADO");
+    }
+
+    updateStartButtonState();
+
+    // Posición desde encoder
+    float cpd = gConfig.counts_per_degree;
+    if (cpd < 1.0f || isnan(cpd) || isinf(cpd)) cpd = 50.0f;
+
+    long enc = gServoState.encoderCount;
+    float pos = (float)enc / cpd;
+    gServoState.positionDeg = sanitizeFloatInternal(pos, 0.0f, -1000.0f, 1000.0f);
+
+    // Corriente
+    updateCurrentMeasurement();
+
+    // Límite magnético
+    if (digitalRead(PIN_LIMIT_MAG) == LOW) {
+      gServoState.faultMagLimit = true;
+    }
+
+    // Fallos "duros"
+    bool blocked =
+      gServoState.faultOCHard   ||
+      gServoState.faultMagLimit ||
+      gServoState.faultNoPaper  ||
+      gServoState.faultEdgeSat;
+
+    if (sManualMode) {
+      // ---- MODO MANUAL ----
+      gServoState.targetDeg = gServoState.positionDeg; // solo para mostrar
+      setMotorOutput(sManualCmd);
+    } else {
+      if (!sOperationEnabled) {
+        gGuideState.servoTargetDeg = sStartupHoldDeg;
+      }
+
+      // ---- MODO AUTOMÁTICO (PID) ----
+      gServoState.targetDeg = gGuideState.servoTargetDeg;
+      gServoState.targetDeg = sanitizeFloatInternal(
+        gServoState.targetDeg,
+        sStartupHoldDeg,
+        0.0f,
+        gConfig.piston_max_travel_deg
+      );
+
+      float error = gServoState.targetDeg - gServoState.positionDeg;
+
+      if (!blocked) {
+        gServoState.pidIntegral += error * 0.001f;
+        gServoState.pidIntegral = constrain(gServoState.pidIntegral, -100.0f, 100.0f);
+      }
+
+      float d = error - gServoState.pidLastError;
+      gServoState.pidLastError = error;
+
+      float u =
+        gConfig.pid_kp * error +
+        gConfig.pid_ki * gServoState.pidIntegral +
+        gConfig.pid_kd * d;
+
+      setMotorOutput(u / 100.0f);
+    }
+
+    // Indicador LED si hay fallo mayor
+    static uint32_t ledMs = 0;
+    ledMs += 1;
+    if (ledMs >= 200) {
+      ledMs = 0;
+      if (blocked)
+        digitalWrite(PIN_LED_STATUS, !digitalRead(PIN_LED_STATUS));
+      else
+        digitalWrite(PIN_LED_STATUS, LOW);
+    }
+
+    // Evita watchdog
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+// ======================
+// GUIDE TASK (CORE 1)
+// ======================
+
+static void guideTask(void *pv) {
+  Serial.print("GuideTask running on core ");
+  Serial.println(xPortGetCoreID());
+
+  // Debounce FIR de 2 muestras por canal
+  uint8_t Lf = 0, Rf = 0;
+  bool L = false, R = false;
+
+  while (true) {
+
+    uint32_t per = gConfig.edge_control_period_ms;
+    if (per < 10) per = 10;
+
+    // ============================
+    // LECTURA CRUDA DE SENSORES
+    // ============================
+    bool Lraw = (digitalRead(PIN_OPT_LEFT)  == LOW);
+    bool Rraw = (digitalRead(PIN_OPT_RIGHT) == LOW);
+
+    // ============================
+    // DEBOUNCE INDUSTRIAL FIR
+    // ============================
+    Lf = ((Lf << 1) | (Lraw ? 1 : 0)) & 0x03;
+    Rf = ((Rf << 1) | (Rraw ? 1 : 0)) & 0x03;
+
+    L = (Lf == 0x03);  
+    R = (Rf == 0x03);
+
+    // =====================================
+    // SIN AUTO Y SIN MANUAL → SOLO SOSTENER
+    // =====================================
+    if (!sOperationEnabled && !sManualMode) {
+      gGuideState.servoTargetDeg = sStartupHoldDeg;
+      vTaskDelay(pdMS_TO_TICKS(per));
+      continue;
+    }
+
+    // ============================
+    // DETECCIÓN "NO PAPER"
+    // ============================
+    if (!L && !R) {
+      gGuideState.noPaperTimeMs += per;
+
+      if (gGuideState.noPaperTimeMs >= gConfig.no_paper_timeout_ms)
+        gServoState.faultNoPaper = true;
+
+    } else {
+      gGuideState.noPaperTimeMs = 0;
+      gServoState.faultNoPaper = false;
+
+      // ============================
+      // CÁLCULO CORREGIDO DEL OFFSET
+      // ============================
+      if (!gServoState.faultEdgeSat) {
+
+        if (L && !R) {
+          // BANDA A LA IZQUIERDA → mover pistón +offset
+          gGuideState.edgeOffsetDeg += gConfig.k_edge_deg_per_step;
+        }
+
+        else if (!L && R) {
+          // BANDA A LA DERECHA → mover pistón -offset
+          gGuideState.edgeOffsetDeg -= gConfig.k_edge_deg_per_step;
+        }
+
+        else if (L && R) {
+          // Papel centrado → amortiguación suave
+          gGuideState.edgeOffsetDeg *= 0.98f;
+        }
+      }
+
+      // Limitar dentro de rango permitido
+      gGuideState.edgeOffsetDeg =
+        constrain(gGuideState.edgeOffsetDeg,
+                  -gConfig.edge_max_deg, gConfig.edge_max_deg);
+    }
+
+    // ============================
+    // CÁLCULO FINAL DEL TARGET
+    // ============================
+    gGuideState.servoTargetDeg =
+      gConfig.home_position_deg + gGuideState.edgeOffsetDeg;
+
+    gGuideState.servoTargetDeg = sanitizeFloatInternal(
+      gGuideState.servoTargetDeg,
+      sStartupHoldDeg,
+      0.0f,
+      gConfig.piston_max_travel_deg
+    );
+
+    vTaskDelay(pdMS_TO_TICKS(per));
+  }
+}
+
+
+
+// ======================
+// HELPERS PÚBLICOS
+// ======================
+
+float getServoPositionDeg() { return gServoState.positionDeg; }
+float getServoTargetDeg()   { return gServoState.targetDeg;   }
+float getCurrentA()         { return gServoState.currentA;    }
+
+float getServoPositionDegSafe() {
+  return sanitizeFloatInternal(gServoState.positionDeg, 0.0f, -1000.0f, 1000.0f);
+}
+
+float getServoTargetDegSafe() {
+  return sanitizeFloatInternal(gServoState.targetDeg, 0.0f, -1000.0f, 1000.0f);
+}
+
+float getCurrentASafe() {
+  return sanitizeFloatInternal(gServoState.currentA, 0.0f, -100.0f, 100.0f);
+}
+
+bool getAnyFault() {
+  return gServoState.faultOCHard ||
+         gServoState.faultMagLimit ||
+         gServoState.faultNoPaper ||
+         gServoState.faultEdgeSat;
+}
+
+String getFaultString() {
+  String s;
+  if (gServoState.faultOCHard)   s += "HARD_OC;";
+  if (gServoState.faultMagLimit) s += "MAG_LIMIT;";
+  if (gServoState.faultNoPaper)  s += "NO_PAPER;";
+  if (gServoState.faultEdgeSat)  s += "EDGE_SAT;";
+  if (!s.length()) s = "OK";
+  return s;
+}
+
+// ---- MODO MANUAL / MANTENIMIENTO ----
+
+void setManualMode(bool enabled) {
+  sManualMode = enabled;
+  if (!enabled) {
+    sManualCmd = 0.0f;
+    setMotorOutput(0.0f);
+  } else {
+    setValveOutput(false);
+    sOperationEnabled = false;
+  }
+
+}
+
+bool getManualMode() {
+  return sManualMode;
+}
+
+void setManualCommand(float cmd) {
+  cmd = constrain(cmd, -1.0f, 1.0f);
+  sManualCmd = cmd;
+}
+
+void setValveOutput(bool on) {
+  sValveState = on;
+  digitalWrite(PIN_VALVE_OUT, on ? HIGH : LOW);
+}
+
+bool getValveOutput() {
+  return sValveState;
+}
+
+void getInputsStatus(bool &optL, bool &optR, bool &limitMag, bool &button) {
+  optL     = (digitalRead(PIN_OPT_LEFT)  == LOW);
+  optR     = (digitalRead(PIN_OPT_RIGHT) == LOW);
+  limitMag = (digitalRead(PIN_LIMIT_MAG) == LOW);
+  button   = (digitalRead(PIN_BUTTON)    == LOW);
+}
+
+
+===== ARCHIVO: GuiderMain\Control.h =====
+// File: Control.h
+#pragma once
+#include <Arduino.h>
+#include "Pins.h"
+#include "Config.h"
+
+struct ServoState {
+  volatile long encoderCount;  // cuenta cruda encoder
+  float positionDeg;           // posición actual (deg)
+  float targetDeg;             // setpoint (deg)
+
+  float pidIntegral;
+  float pidLastError;
+
+  float currentA;
+
+  bool faultOCSoft;
+  bool faultOCHard;
+  bool faultMagLimit;
+  bool faultNoPaper;
+  bool faultEdgeSat;
+
+  bool paperPresent;
+};
+
+struct GuideState {
+  float    edgeOffsetDeg;      // offset desde home
+  float    servoTargetDeg;     // home + offset
+
+  uint8_t  lastL;
+  uint8_t  lastR;
+  uint32_t sameStateTimeMs;
+
+  uint32_t noPaperTimeMs;
+  uint32_t satTimeMs;
+};
+
+extern ServoState gServoState;
+extern GuideState gGuideState;
+
+// Inicialización y tareas
+void initIO();
+void performStartupHoming();
+void initControlTasks();
+
+// Estado del servo / fallos
+float  getServoPositionDeg();
+float  getServoTargetDeg();
+float  getCurrentA();
+bool   getAnyFault();
+String getFaultString();
+
+// Versiones "seguras" para JSON (sanitizadas)
+float  getServoPositionDegSafe();
+float  getServoTargetDegSafe();
+float  getCurrentASafe();
+
+// ---- MODO MANTENIMIENTO / MANUAL ----
+void setManualMode(bool enabled);
+bool getManualMode();
+void setManualCommand(float cmd);     // -1.0 .. 1.0 (izq/der)
+void setValveOutput(bool on);
+bool getValveOutput();
+
+// Lectura de entradas digitales (para web de mantenimiento)
+void getInputsStatus(bool &optL, bool &optR, bool &limitMag, bool &button);
+
+
+===== ARCHIVO: GuiderMain\GuiderMain.ino =====
+// File: GuiderMain.ino
+#include <Arduino.h>
+#include "Config.h"
+#include "Control.h"
+#include "WebConfig.h"
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  Serial.println();
+  Serial.println("DEPROS GUIADOR ESP32 - BOOT");
+
+  // Carga configuración desde EEPROM (o setea default)
+  loadConfig();
+
+  // Inicializa IO (pines, encoder, sensores, etc.)
+  initIO();
+
+  // Homing inicial y posicionamiento de arranque
+  performStartupHoming();
+
+  // Crea tareas FreeRTOS para control y guiador
+  initControlTasks();
+
+  // Inicia WiFi en modo AP + servidor HTTP de configuración
+  initWiFiAndWeb();
+
+  Serial.println("SYSTEM READY");
+}
+
+void loop() {
+  // Atiende peticiones HTTP (config / status)
+  webLoop();
+
+  // Cede CPU al scheduler / WDT core 1
+  delay(1);
+  yield();
+}
+
+
+===== ARCHIVO: GuiderMain\Pins.h =====
+#pragma once
+#include <Arduino.h>
+
+// =========================
+// ENCODER
+// =========================
+#define PIN_ENC_A        16
+#define PIN_ENC_B        17
+// (Elegidos entre: 5,17,16,4,0,2,15 → solo 16 y 17 sirven sin problemas)
+
+// =========================
+// BTS7960 DRIVER
+// =========================
+#define PIN_RPWM         32
+#define PIN_LPWM         33
+#define PIN_REN          25
+#define PIN_LEN          26
+
+// =========================
+// SENSOR DE CORRIENTE (ADC1)
+// =========================a
+#define PIN_CURRENT_ADC  35   // Solo entrada → perfecto para sensor
+
+// =========================
+// ENTRADAS OPTICAS + BOTON
+// =========================
+#define PIN_OPT_LEFT     18   // L
+#define PIN_OPT_RIGHT    19   // R
+#define PIN_LIMIT_MAG    21   // Final de carrera
+#define PIN_BUTTON       22   // Botón
+
+// =========================
+// SALIDA VALVULA/RELE
+// =========================
+#define PIN_VALVE_OUT    23   // 34 NO sirve → SOLO ENTRADA
+
+// =========================
+// LED STATUS
+// =========================
+#define PIN_LED_STATUS    2   // Cuidado: mantiene requerimientos de boot
+
+
+===== ARCHIVO: GuiderMain\WebConfig.cpp =====
+// File: WebConfig.cpp
+#include "WebConfig.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+#include "Config.h"
+#include "Control.h"
+#include <math.h>
+
+// --------- CONFIG WIFI AP ---------
+static const char *AP_SSID = "DEPROS-GUIDER";
+static const char *AP_PASS = "depros1234";
+
+static WebServer server(80);
+
+// --------- HTML PRINCIPAL ---------
+static const char MAIN_PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>DEPROS Guider ESP32</title>
+<style>
+body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#f4f4f4;}
+#wrap{max-width:1100px;margin:10px auto;background:#fff;border-radius:8px;
+      box-shadow:0 0 10px rgba(0,0,0,0.15);padding:16px;}
+h1{margin-top:0;}
+h2,h3{margin-bottom:6px;}
+.status{background:#eee;padding:8px;border-radius:6px;font-size:14px;margin-bottom:10px;}
+.grid{display:flex;gap:16px;flex-wrap:wrap;}
+.col{flex:1;min-width:320px;}
+label{display:block;font-size:12px;margin-top:6px;}
+input{width:100%;padding:4px;margin-top:2px;font-size:12px;box-sizing:border-box;}
+button{margin-top:6px;padding:6px 12px;background:#0077cc;color:#fff;border:none;
+       border-radius:4px;cursor:pointer;font-size:12px;}
+button:hover{background:#005fa3;}
+canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;display:block;}
+.badge{display:inline-block;padding:2px 6px;border-radius:4px;font-size:11px;margin-left:4px;}
+.badge-ok{background:#c8e6c9;color:#256029;}
+.badge-warn{background:#fff9c4;color:#827717;}
+.badge-err{background:#ffcdd2;color:#b71c1c;}
+.flex-row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:4px;}
+.io-pill{display:inline-block;padding:3px 8px;border-radius:12px;font-size:11px;
+         border:1px solid #ccc;margin:2px 4px 0 0;}
+.io-on{background:#c8e6c9;border-color:#2e7d32;color:#1b5e20;}
+.io-off{background:#ffcdd2;border-color:#c62828;color:#b71c1c;}
+.switch-row{display:flex;align-items:center;gap:6px;margin-top:4px;}
+</style>
+</head>
+<body>
+
+<div id="wrap">
+<h1>DEPROS GUIADOR ESP32</h1>
+
+<div id="data_status" class="status">Conectando...</div>
+
+<div class="status">
+  <div>Posición: <span id="pos">0</span> °</div>
+  <div>Target: <span id="tgt">0</span> °</div>
+  <div>Corriente: <span id="cur">0</span> A</div>
+  <div>Estado: <span id="flt">OK</span></div>
+  <div>Modo: <span id="modeLabel">AUTO</span>
+    <span id="modeBadge" class="badge badge-ok">AUTO</span>
+  </div>
+  <div>Válvula: <span id="valveLabel">OFF</span></div>
+</div>
+
+<div class="grid">
+  <div class="col">
+    <h2>Gráfico en vivo</h2>
+    <canvas id="plot"></canvas>
+
+    <h2>Mantenimiento / Control manual</h2>
+
+    <div class="switch-row">
+      <input type="checkbox" id="manual_mode" onchange="onManualModeChange(this)">
+      <label for="manual_mode">Modo manual</label>
+    </div>
+
+    <div class="flex-row">
+      <button type="button" onclick="sendManualCmd('left')">◀ Izquierda</button>
+      <button type="button" onclick="sendManualCmd('stop')">■ Stop</button>
+      <button type="button" onclick="sendManualCmd('right')">Derecha ▶</button>
+    </div>
+
+    <h3>Entradas</h3>
+    <div id="io_status">
+      <span id="io_optL" class="io-pill io-off">Opt L</span>
+      <span id="io_optR" class="io-pill io-off">Opt R</span>
+      <span id="io_limit" class="io-pill io-off">Limit Mag</span>
+      <span id="io_button" class="io-pill io-off">Botón</span>
+    </div>
+
+    <h3>Válvula / Relé de salida</h3>
+    <div class="flex-row">
+      <button type="button" onclick="toggleValve()">Toggle válvula</button>
+    </div>
+  </div>
+
+  <div class="col">
+    <h2>Configuración</h2>
+    <form id="cfgForm">
+
+      <label>Home (°)<input name="home_position_deg" id="home_position_deg"></label>
+      <label>Offset máximo (°)<input name="edge_max_deg" id="edge_max_deg"></label>
+      <label>K_EDGE (°/step)<input name="k_edge_deg_per_step" id="k_edge_deg_per_step"></label>
+      <label>Recorrido máx. pistón (°)<input name="piston_max_travel_deg" id="piston_max_travel_deg"></label>
+      <label>Periodo control borde (ms)<input name="edge_control_period_ms" id="edge_control_period_ms"></label>
+      <label>Debounce (ms)<input name="edge_debounce_ms" id="edge_debounce_ms"></label>
+      <label>No paper timeout (ms)<input name="no_paper_timeout_ms" id="no_paper_timeout_ms"></label>
+      <label>Saturación timeout (ms)<input name="edge_saturation_timeout_ms" id="edge_saturation_timeout_ms"></label>
+
+      <h3>PID</h3>
+      <label>Kp <input name="pid_kp" id="pid_kp"></label>
+      <label>Ki <input name="pid_ki" id="pid_ki"></label>
+      <label>Kd <input name="pid_kd" id="pid_kd"></label>
+      <label>Counts por grado <input name="counts_per_degree" id="counts_per_degree"></label>
+
+      <h3>Corriente</h3>
+      <label>Soft limit (A)<input name="soft_current_limitA" id="soft_current_limitA"></label>
+      <label>Hard limit (A)<input name="hard_current_limitA" id="hard_current_limitA"></label>
+      <label>ADC offset <input name="current_adc_offset" id="current_adc_offset"></label>
+      <label>ADC scale (A/count)<input name="current_adc_scale" id="current_adc_scale"></label>
+
+      <button type="button" onclick="sendConfig()">Guardar config</button>
+    </form>
+  </div>
+</div>
+
+</div>
+
+<script>
+let posEl=document.getElementById('pos');
+let tgtEl=document.getElementById('tgt');
+let curEl=document.getElementById('cur');
+let fltEl=document.getElementById('flt');
+let modeLabel=document.getElementById('modeLabel');
+let modeBadge=document.getElementById('modeBadge');
+let valveLabel=document.getElementById('valveLabel');
+let manualModeCheckbox=document.getElementById('manual_mode');
+let dataStatus=document.getElementById('data_status');
+
+let ioOptL=document.getElementById('io_optL');
+let ioOptR=document.getElementById('io_optR');
+let ioLimit=document.getElementById('io_limit');
+let ioButton=document.getElementById('io_button');
+
+let valveState = 0;
+
+const MAX_POINTS=300;
+const PLOT_HEIGHT=250;
+let dataTime=[], dataPos=[], dataTgt=[];
+let t0=null;
+
+// =========================
+// CANVAS FIX – DOMContentLoaded
+// =========================
+document.addEventListener("DOMContentLoaded", () => {
+  const canvas = document.getElementById("plot");
+  if (!canvas) return;
+  canvas.width = canvas.clientWidth;
+  canvas.height = PLOT_HEIGHT;
+});
+
+// =========================
+// HELPERS UI
+// =========================
+
+function setDataStatus(text, level='info'){
+  let cls='status';
+  if(level==='ok') cls+=' badge-ok';
+  else if(level==='warn') cls+=' badge-warn';
+  else if(level==='err') cls+=' badge-err';
+  dataStatus.className=cls;
+  dataStatus.textContent=text;
+}
+
+function safeJsonParse(txt){
+  try{
+    return JSON.parse(txt);
+  }catch(e){
+    console.log("JSON inválido:", txt);
+    setDataStatus("JSON inválido recibido del equipo","err");
+    return null;
+  }
+}
+
+function fetchConfig(){
+  fetch('/config')
+    .then(r=>r.text())
+    .then(txt=>{
+      const cfg = safeJsonParse(txt);
+      if(!cfg) return;
+      for(let k in cfg){
+        let el=document.getElementById(k);
+        if(el) el.value=cfg[k];
+      }
+      setDataStatus("Configuración leída","ok");
+    })
+    .catch(e=>{
+      console.log(e);
+      setDataStatus('No se pudo leer configuración','warn');
+    });
+}
+
+function fetchStatus(){
+  fetch('/status')
+    .then(r=>r.text())
+    .then(txt=>{
+      const st = safeJsonParse(txt);
+      if(!st) return;
+
+      posEl.textContent=st.pos.toFixed(2);
+      tgtEl.textContent=st.tgt.toFixed(2);
+      curEl.textContent=st.cur.toFixed(2);
+      fltEl.textContent=st.flt;
+
+      manualModeCheckbox.checked = (st.manual === 1);
+      valveState = st.valve;
+      valveLabel.textContent = valveState ? "ON" : "OFF";
+
+      if(st.manual === 1){
+        modeLabel.textContent="MANUAL";
+        modeBadge.textContent="MANUAL";
+        modeBadge.className="badge badge-warn";
+      } else {
+        modeLabel.textContent="AUTO";
+        modeBadge.textContent="AUTO";
+        modeBadge.className="badge badge-ok";
+      }
+
+      let t=st.t;
+      if(t0===null) t0=t;
+      let tt=(t-t0)/1000.0;
+
+      dataTime.push(tt);
+      dataPos.push(st.pos);
+      dataTgt.push(st.tgt);
+
+      if(dataTime.length>MAX_POINTS){
+        dataTime.shift();
+        dataPos.shift();
+        dataTgt.shift();
+      }
+
+      drawPlot();
+      setDataStatus("Datos actualizados","ok");
+    })
+    .catch(e=>{
+      console.log(e);
+      setDataStatus("Sin comunicación con el equipo","err");
+    });
+}
+
+function fetchIOStatus(){
+  fetch('/io_status')
+    .then(r=>r.text())
+    .then(txt=>{
+      const io = safeJsonParse(txt);
+      if(!io) return;
+      setIoPill(ioOptL, io.optL);
+      setIoPill(ioOptR, io.optR);
+      setIoPill(ioLimit, io.limitMag);
+      setIoPill(ioButton, io.button);
+      valveState = io.valve;
+      valveLabel.textContent = valveState ? "ON" : "OFF";
+      manualModeCheckbox.checked = (io.manual === 1);
+    })
+    .catch(e=>console.log(e));
+}
+
+function setIoPill(elem, on){
+  if(on){
+    elem.classList.add('io-on');
+    elem.classList.remove('io-off');
+  } else {
+    elem.classList.add('io-off');
+    elem.classList.remove('io-on');
+  }
+}
+
+// =========================
+// PLOT
+// =========================
+
+function resizePlot(){
+  let canvas=document.getElementById('plot');
+  if(!canvas) return;
+  const w = canvas.clientWidth;
+  if(w > 0) canvas.width = w;
+  canvas.height = PLOT_HEIGHT;
+  drawPlot();
+}
+
+function drawPlot(){
+  let canvas=document.getElementById('plot');
+  if(!canvas) return;
+  let ctx=canvas.getContext('2d');
+  let w=canvas.width, h=canvas.height;
+
+  ctx.clearRect(0,0,w,h);
+
+  if(dataTime.length<2){
+    ctx.fillStyle='#777';
+    ctx.font='14px Arial';
+    ctx.fillText('Esperando datos...', 16, 24);
+    return;
+  }
+
+  let tmin=dataTime[0];
+  let tmax=dataTime[dataTime.length-1];
+  let ymin=Math.min(...dataPos, ...dataTgt);
+  let ymax=Math.max(...dataPos, ...dataTgt);
+
+  if(ymax-ymin<1){ ymax+=0.5; ymin-=0.5; }
+
+  function tx(t){ return 10 + (t-tmin)/(tmax-tmin) * (w-20); }
+  function ty(y){ return h-10 - (y-ymin)/(ymax-ymin) * (h-20); }
+
+  ctx.strokeStyle='#ccc';
+  ctx.beginPath();
+  ctx.moveTo(10,10);
+  ctx.lineTo(10,h-10);
+  ctx.lineTo(w-10,h-10);
+  ctx.stroke();
+
+  ctx.strokeStyle='red';
+  ctx.beginPath();
+  ctx.moveTo(tx(dataTime[0]), ty(dataTgt[0]));
+  for(let i=1;i<dataTime.length;i++){
+    ctx.lineTo(tx(dataTime[i]), ty(dataTgt[i]));
+  }
+  ctx.stroke();
+
+  ctx.strokeStyle='blue';
+  ctx.beginPath();
+  ctx.moveTo(tx(dataTime[0]), ty(dataPos[0]));
+  for(let i=1;i<dataTime.length;i++){
+    ctx.lineTo(tx(dataTime[i]), ty(dataPos[i]));
+  }
+  ctx.stroke();
+}
+
+// =========================
+// SET CONFIG
+// =========================
+
+function sendConfig(){
+  let form=document.getElementById('cfgForm');
+  let params=new URLSearchParams();
+
+  for(let i=0;i<form.elements.length;i++){
+    let e=form.elements[i];
+    if(e.name) params.append(e.name, e.value);
+  }
+
+  fetch('/setConfig',{method:'POST',body:params})
+    .then(r=>r.text())
+    .then(t=>console.log("cfg resp",t))
+    .catch(e=>console.log(e));
+}
+
+// =========================
+// MANUAL MODE
+// =========================
+
+function onManualModeChange(chk){
+  let params=new URLSearchParams();
+  params.append('mode', chk.checked ? "1" : "0");
+  fetch('/manual',{method:'POST',body:params})
+    .then(r=>r.text())
+    .then(t=>console.log("manual mode resp",t))
+    .catch(e=>console.log(e));
+}
+
+function sendManualCmd(cmd){
+  let params=new URLSearchParams();
+  params.append('cmd', cmd);
+  fetch('/manual',{method:'POST',body:params})
+    .then(r=>r.text())
+    .then(t=>console.log("manual cmd resp",t))
+    .catch(e=>console.log(e));
+}
+
+// =========================
+// VÁLVULA
+// =========================
+
+function toggleValve(){
+  let newState = valveState ? 0 : 1;
+  valveState = newState;
+
+  let params=new URLSearchParams();
+  params.append('state', newState.toString());
+
+  fetch('/valve',{method:'POST',body:params})
+    .then(r=>r.text())
+    .then(t=>console.log("valve resp",t))
+    .catch(e=>console.log(e));
+}
+
+// =========================
+// ONLOAD CON RETRASO
+// =========================
+
+window.onload=function(){
+  setTimeout(() => {
+    resizePlot();
+    fetchConfig();
+    setInterval(fetchStatus, 300);
+    setInterval(fetchIOStatus, 500);
+  }, 800);
+};
+
+window.addEventListener('resize', resizePlot);
+
+</script>
+</body>
+</html>
+)HTML";
+
+// --------- HELPERS PARAMS ---------
+
+static float getArgFloat(const String &name, float currentVal) {
+  if (!server.hasArg(name)) return currentVal;
+  return server.arg(name).toFloat();
+}
+static uint32_t getArgU32(const String &name, uint32_t currentVal) {
+  if (!server.hasArg(name)) return currentVal;
+  return (uint32_t)server.arg(name).toInt();
+}
+static uint16_t getArgU16(const String &name, uint16_t currentVal) {
+  if (!server.hasArg(name)) return currentVal;
+  return (uint16_t)server.arg(name).toInt();
+}
+
+// --------- HANDLERS ---------
+
+static void handleRoot() {
+  server.send_P(200, "text/html", MAIN_PAGE);
+}
+
+static void handleStatus() {
+  // Usamos las versiones "safe" que nunca devuelven NaN/Inf
+  float pos = getServoPositionDegSafe();
+  float tgt = getServoTargetDegSafe();
+  float cur = getCurrentASafe();
+
+  String json = "{";
+  json += "\"t\":"   + String(millis()) + ",";
+  json += "\"pos\":" + String(pos,3) + ",";
+  json += "\"tgt\":" + String(tgt,3) + ",";
+  json += "\"cur\":" + String(cur,3) + ",";
+  json += "\"flt\":\"" + getFaultString() + "\",";
+  json += "\"manual\":" + String(getManualMode() ? 1 : 0) + ",";
+  json += "\"valve\":"  + String(getValveOutput() ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleConfigGet() {
+  String json = "{";
+  json += "\"home_position_deg\":"          + String(gConfig.home_position_deg)          + ",";
+  json += "\"edge_max_deg\":"               + String(gConfig.edge_max_deg)               + ",";
+  json += "\"k_edge_deg_per_step\":"        + String(gConfig.k_edge_deg_per_step)        + ",";
+  json += "\"piston_max_travel_deg\":"      + String(gConfig.piston_max_travel_deg)      + ",";
+  json += "\"edge_control_period_ms\":"     + String(gConfig.edge_control_period_ms)     + ",";
+  json += "\"edge_debounce_ms\":"           + String(gConfig.edge_debounce_ms)           + ",";
+  json += "\"no_paper_timeout_ms\":"        + String(gConfig.no_paper_timeout_ms)        + ",";
+  json += "\"edge_saturation_timeout_ms\":" + String(gConfig.edge_saturation_timeout_ms) + ",";
+  json += "\"pid_kp\":"                     + String(gConfig.pid_kp)                     + ",";
+  json += "\"pid_ki\":"                     + String(gConfig.pid_ki)                     + ",";
+  json += "\"pid_kd\":"                     + String(gConfig.pid_kd)                     + ",";
+  json += "\"counts_per_degree\":"          + String(gConfig.counts_per_degree)          + ",";
+  json += "\"soft_current_limitA\":"        + String(gConfig.soft_current_limitA)        + ",";
+  json += "\"hard_current_limitA\":"        + String(gConfig.hard_current_limitA)        + ",";
+  json += "\"current_adc_offset\":"         + String(gConfig.current_adc_offset)         + ",";
+  json += "\"current_adc_scale\":"          + String(gConfig.current_adc_scale);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleConfigPost() {
+  gConfig.home_position_deg          = getArgFloat("home_position_deg",          gConfig.home_position_deg);
+  gConfig.edge_max_deg               = getArgFloat("edge_max_deg",               gConfig.edge_max_deg);
+  gConfig.k_edge_deg_per_step        = getArgFloat("k_edge_deg_per_step",        gConfig.k_edge_deg_per_step);
+  gConfig.piston_max_travel_deg      = getArgFloat("piston_max_travel_deg",      gConfig.piston_max_travel_deg);
+  gConfig.edge_control_period_ms     = getArgU32 ("edge_control_period_ms",      gConfig.edge_control_period_ms);
+  gConfig.edge_debounce_ms           = getArgU32 ("edge_debounce_ms",            gConfig.edge_debounce_ms);
+  gConfig.no_paper_timeout_ms        = getArgU32 ("no_paper_timeout_ms",         gConfig.no_paper_timeout_ms);
+  gConfig.edge_saturation_timeout_ms = getArgU32 ("edge_saturation_timeout_ms",  gConfig.edge_saturation_timeout_ms);
+
+  gConfig.pid_kp                     = getArgFloat("pid_kp",                     gConfig.pid_kp);
+  gConfig.pid_ki                     = getArgFloat("pid_ki",                     gConfig.pid_ki);
+  gConfig.pid_kd                     = getArgFloat("pid_kd",                     gConfig.pid_kd);
+  gConfig.counts_per_degree          = getArgFloat("counts_per_degree",          gConfig.counts_per_degree);
+
+  gConfig.soft_current_limitA        = getArgFloat("soft_current_limitA",        gConfig.soft_current_limitA);
+  gConfig.hard_current_limitA        = getArgFloat("hard_current_limitA",        gConfig.hard_current_limitA);
+  gConfig.current_adc_offset         = getArgU16 ("current_adc_offset",          gConfig.current_adc_offset);
+  gConfig.current_adc_scale          = getArgFloat("current_adc_scale",          gConfig.current_adc_scale);
+
+  saveConfig();
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleIOStatus() {
+  bool optL, optR, limitMag, button;
+  getInputsStatus(optL, optR, limitMag, button);
+  bool valve  = getValveOutput();
+  bool manual = getManualMode();
+
+  String json = "{";
+  json += "\"optL\":"     + String(optL ? 1 : 0) + ",";
+  json += "\"optR\":"     + String(optR ? 1 : 0) + ",";
+  json += "\"limitMag\":" + String(limitMag ? 1 : 0) + ",";
+  json += "\"button\":"   + String(button ? 1 : 0) + ",";
+  json += "\"valve\":"    + String(valve ? 1 : 0) + ",";
+  json += "\"manual\":"   + String(manual ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleManual() {
+  if (server.hasArg("mode")) {
+    String m = server.arg("mode");
+    bool enabled = (m == "1" || m == "true" || m == "on");
+    setManualMode(enabled);
+  }
+
+  if (server.hasArg("cmd")) {
+    String c = server.arg("cmd");
+    float v = 0.0f;
+    if (c == "left")      v = -1.0f;
+    else if (c == "right")v =  1.0f;
+    else if (c == "stop") v =  0.0f;
+    else                  v = c.toFloat();
+    setManualCommand(v);
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleValve() {
+  if (server.hasArg("state")) {
+    String s = server.arg("state");
+    bool on = (s == "1" || s == "true" || s == "on");
+    setValveOutput(on);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+static void handleNotFound() {
+  server.send(404, "text/plain", "Not found");
+}
+
+// --------- INICIALIZACIÓN WIFI + WEB ---------
+
+void initWiFiAndWeb() {
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);   // evita cortes de WiFi en AP
+  WiFi.softAP(AP_SSID, AP_PASS);
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("AP IP: ");
+  Serial.println(ip);
+
+  server.on("/",           HTTP_GET,  handleRoot);
+  server.on("/status",     HTTP_GET,  handleStatus);
+  server.on("/config",     HTTP_GET,  handleConfigGet);
+  server.on("/setConfig",  HTTP_POST, handleConfigPost);
+  server.on("/io_status",  HTTP_GET,  handleIOStatus);
+  server.on("/manual",     HTTP_POST, handleManual);
+  server.on("/valve",      HTTP_POST, handleValve);
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void webLoop() {
+  server.handleClient();
+}
+
+
+===== ARCHIVO: GuiderMain\WebConfig.h =====
+// File: WebConfig.h
+#pragma once
+#include <Arduino.h>
+
+void initWiFiAndWeb();
+void webLoop();
+
+

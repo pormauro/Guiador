@@ -18,7 +18,7 @@
 
 // =========================
 // SENSOR DE CORRIENTE (ADC1)
-// =========================
+// =========================a
 #define PIN_CURRENT_ADC  35   // Solo entrada → perfecto para sensor
 
 // =========================

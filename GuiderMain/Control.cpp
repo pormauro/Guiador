@@ -38,6 +38,20 @@ static volatile bool sOperationEnabled = false;
 static float         sStartupHoldDeg   = 0.0f;
 
 // ======================
+// HELPERS INTERNOS
+// ======================
+
+static float sanitizeFloatInternal(float v,
+                                   float fallback = 0.0f,
+                                   float minV = -100000.0f,
+                                   float maxV =  100000.0f) {
+  if (isnan(v) || isinf(v)) return fallback;
+  if (v < minV) return minV;
+  if (v > maxV) return maxV;
+  return v;
+}
+
+// ======================
 // PROTOTIPOS INTERNOS
 // ======================
 
@@ -101,6 +115,19 @@ void initIO() {
   gGuideState.lastL = 2;
   gGuideState.lastR = 2;
 
+  gServoState.encoderCount  = 0;
+  gServoState.positionDeg   = 0.0f;
+  gServoState.targetDeg     = 0.0f;
+  gServoState.pidIntegral   = 0.0f;
+  gServoState.pidLastError  = 0.0f;
+  gServoState.currentA      = 0.0f;
+  gServoState.faultOCSoft   = false;
+  gServoState.faultOCHard   = false;
+  gServoState.faultMagLimit = false;
+  gServoState.faultNoPaper  = false;
+  gServoState.faultEdgeSat  = false;
+  gServoState.paperPresent  = false;
+
   Serial.println("IO OK (PWM con analogWrite).");
 }
 
@@ -135,8 +162,9 @@ void performStartupHoming() {
     gServoState.faultMagLimit = true;
   }
 
-  sStartupHoldDeg = gConfig.piston_max_travel_deg * 0.5f;
-  gGuideState.edgeOffsetDeg  = 0.0f;
+  sStartupHoldDeg           = gConfig.piston_max_travel_deg * 0.5f;
+  sStartupHoldDeg           = sanitizeFloatInternal(sStartupHoldDeg, 20.0f, 0.0f, gConfig.piston_max_travel_deg);
+  gGuideState.edgeOffsetDeg = 0.0f;
   gGuideState.servoTargetDeg = sStartupHoldDeg;
 
   moveToDegBlocking(sStartupHoldDeg, 4000);
@@ -157,7 +185,7 @@ void initControlTasks() {
     "ControlTask",
     6000,
     nullptr,
-    3,
+    2,
     nullptr,
     1
   );
@@ -168,7 +196,7 @@ void initControlTasks() {
     "GuideTask",
     5000,
     nullptr,
-    2,
+    1,
     nullptr,
     1
   );
@@ -199,12 +227,13 @@ static void IRAM_ATTR isrEncB() {
 static void updateCurrentMeasurement() {
   uint16_t raw = analogRead(PIN_CURRENT_ADC);
 
-  static float filt = 2048;
+  static float filt = 2048.0f;
   filt = 0.9f * filt + 0.1f * raw;
 
-  float I = (filt - gConfig.current_adc_offset) * gConfig.current_adc_scale;
+  float I = (filt - (float)gConfig.current_adc_offset) * gConfig.current_adc_scale;
+  I = sanitizeFloatInternal(I, 0.0f, -100.0f, 100.0f);
 
-  gServoState.currentA = I;
+  gServoState.currentA   = I;
   gServoState.faultOCSoft = (I > gConfig.soft_current_limitA);
 
   if (I > gConfig.hard_current_limitA) {
@@ -218,7 +247,7 @@ static void updateCurrentMeasurement() {
 
 static void setMotorOutput(float u) {
   bool fault =
-    gServoState.faultOCHard  ||
+    gServoState.faultOCHard   ||
     gServoState.faultMagLimit ||
     gServoState.faultNoPaper  ||
     gServoState.faultEdgeSat;
@@ -255,10 +284,14 @@ static void setMotorOutput(float u) {
   }
 }
 
+// Mueve el pistón a un ángulo simple (sin PID completo) durante el homing
 static void moveToDegBlocking(float targetDeg, uint32_t timeoutMs) {
   uint32_t start = millis();
   while ((millis() - start) < timeoutMs) {
-    float posDeg = gServoState.encoderCount / gConfig.counts_per_degree;
+    float cpd = gConfig.counts_per_degree;
+    if (cpd < 1.0f || isnan(cpd) || isinf(cpd)) cpd = 50.0f;
+
+    float posDeg = (float)gServoState.encoderCount / cpd;
     float error  = targetDeg - posDeg;
     if (fabs(error) < 0.2f) break;
 
@@ -270,18 +303,27 @@ static void moveToDegBlocking(float targetDeg, uint32_t timeoutMs) {
 }
 
 static void updateStartButtonState() {
-  static uint32_t pressedMs = 0;
-  bool pressed = (digitalRead(PIN_BUTTON) == LOW);
+  static bool last = true; // HIGH = no presionado (por pullup)
+  bool now = (digitalRead(PIN_BUTTON) == LOW);
 
-  if (pressed) {
-    if (pressedMs < 1000) pressedMs++;
-    if (pressedMs > 50) {
-      sOperationEnabled = true;
+  // Detecta flanco descendente (presionado)
+  if (now && !last) {
+    // TOGGLE de auto
+    sOperationEnabled = !sOperationEnabled;
+
+    // Manejo del relé según modo auto
+    if (sOperationEnabled) {
+      setValveOutput(true);   // relé ON en AUTO
+    } else {
+      setValveOutput(false);  // relé OFF al salir de AUTO
     }
-  } else {
-    pressedMs = 0;
+
+    Serial.printf("AUTO MODE = %d\n", sOperationEnabled);
   }
+
+  last = now;
 }
+
 
 // ======================
 // CONTROL TASK (CORE 1)
@@ -292,11 +334,22 @@ static void controlTask(void *pv) {
   Serial.println(xPortGetCoreID());
 
   while (true) {
+
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      Serial.println("BOTON DETECTADO");
+    }
+
     updateStartButtonState();
 
     // Posición desde encoder
+    float cpd = gConfig.counts_per_degree;
+    if (cpd < 1.0f || isnan(cpd) || isinf(cpd)) cpd = 50.0f;
+
     long enc = gServoState.encoderCount;
-    gServoState.positionDeg = enc / gConfig.counts_per_degree;
+    float pos = (float)enc / cpd;
+    gServoState.positionDeg = sanitizeFloatInternal(pos, 0.0f, -1000.0f, 1000.0f);
 
     // Corriente
     updateCurrentMeasurement();
@@ -308,14 +361,14 @@ static void controlTask(void *pv) {
 
     // Fallos "duros"
     bool blocked =
-      gServoState.faultOCHard  ||
+      gServoState.faultOCHard   ||
       gServoState.faultMagLimit ||
       gServoState.faultNoPaper  ||
       gServoState.faultEdgeSat;
 
     if (sManualMode) {
       // ---- MODO MANUAL ----
-      gServoState.targetDeg = gServoState.positionDeg; // setpoint = actual (para mostrar)
+      gServoState.targetDeg = gServoState.positionDeg; // solo para mostrar
       setMotorOutput(sManualCmd);
     } else {
       if (!sOperationEnabled) {
@@ -324,6 +377,12 @@ static void controlTask(void *pv) {
 
       // ---- MODO AUTOMÁTICO (PID) ----
       gServoState.targetDeg = gGuideState.servoTargetDeg;
+      gServoState.targetDeg = sanitizeFloatInternal(
+        gServoState.targetDeg,
+        sStartupHoldDeg,
+        0.0f,
+        gConfig.piston_max_travel_deg
+      );
 
       float error = gServoState.targetDeg - gServoState.positionDeg;
 
@@ -367,60 +426,97 @@ static void guideTask(void *pv) {
   Serial.print("GuideTask running on core ");
   Serial.println(xPortGetCoreID());
 
+  // Debounce FIR de 2 muestras por canal
+  uint8_t Lf = 0, Rf = 0;
+  bool L = false, R = false;
+
   while (true) {
+
     uint32_t per = gConfig.edge_control_period_ms;
     if (per < 10) per = 10;
 
+    // ============================
+    // LECTURA CRUDA DE SENSORES
+    // ============================
+    bool Lraw = (digitalRead(PIN_OPT_LEFT)  == LOW);
+    bool Rraw = (digitalRead(PIN_OPT_RIGHT) == LOW);
+
+    // ============================
+    // DEBOUNCE INDUSTRIAL FIR
+    // ============================
+    Lf = ((Lf << 1) | (Lraw ? 1 : 0)) & 0x03;
+    Rf = ((Rf << 1) | (Rraw ? 1 : 0)) & 0x03;
+
+    L = (Lf == 0x03);  
+    R = (Rf == 0x03);
+
+    // =====================================
+    // SIN AUTO Y SIN MANUAL → SOLO SOSTENER
+    // =====================================
     if (!sOperationEnabled && !sManualMode) {
       gGuideState.servoTargetDeg = sStartupHoldDeg;
       vTaskDelay(pdMS_TO_TICKS(per));
       continue;
     }
 
-    uint8_t L = (digitalRead(PIN_OPT_LEFT)  == LOW);
-    uint8_t R = (digitalRead(PIN_OPT_RIGHT) == LOW);
+    // ============================
+    // DETECCIÓN "NO PAPER"
+    // ============================
+    if (!L && !R) {
+      gGuideState.noPaperTimeMs += per;
 
-    // Debounce
-    if (L == gGuideState.lastL && R == gGuideState.lastR) {
-      gGuideState.sameStateTimeMs += per;
+      if (gGuideState.noPaperTimeMs >= gConfig.no_paper_timeout_ms)
+        gServoState.faultNoPaper = true;
+
     } else {
-      gGuideState.sameStateTimeMs = 0;
-      gGuideState.lastL = L;
-      gGuideState.lastR = R;
-    }
+      gGuideState.noPaperTimeMs = 0;
+      gServoState.faultNoPaper = false;
 
-    if (gGuideState.sameStateTimeMs >= gConfig.edge_debounce_ms) {
-      if (!L && !R) {
-        // sin papel
-        gGuideState.noPaperTimeMs += per;
-        if (gGuideState.noPaperTimeMs >= gConfig.no_paper_timeout_ms)
-          gServoState.faultNoPaper = true;
-      } else {
-        // con papel
-        gGuideState.noPaperTimeMs = 0;
-        gServoState.faultNoPaper = false;
+      // ============================
+      // CÁLCULO CORREGIDO DEL OFFSET
+      // ============================
+      if (!gServoState.faultEdgeSat) {
 
-        if (!gServoState.faultEdgeSat) {
-          if (L && !R)
-            gGuideState.edgeOffsetDeg += gConfig.k_edge_deg_per_step;
-          else if (!L && R)
-            gGuideState.edgeOffsetDeg -= gConfig.k_edge_deg_per_step;
-          else if (L && R)
-            gGuideState.edgeOffsetDeg *= 0.98f;
+        if (L && !R) {
+          // BANDA A LA IZQUIERDA → mover pistón +offset
+          gGuideState.edgeOffsetDeg += gConfig.k_edge_deg_per_step;
         }
 
-        gGuideState.edgeOffsetDeg =
-          constrain(gGuideState.edgeOffsetDeg,
-                    -gConfig.edge_max_deg, gConfig.edge_max_deg);
+        else if (!L && R) {
+          // BANDA A LA DERECHA → mover pistón -offset
+          gGuideState.edgeOffsetDeg -= gConfig.k_edge_deg_per_step;
+        }
+
+        else if (L && R) {
+          // Papel centrado → amortiguación suave
+          gGuideState.edgeOffsetDeg *= 0.98f;
+        }
       }
+
+      // Limitar dentro de rango permitido
+      gGuideState.edgeOffsetDeg =
+        constrain(gGuideState.edgeOffsetDeg,
+                  -gConfig.edge_max_deg, gConfig.edge_max_deg);
     }
 
+    // ============================
+    // CÁLCULO FINAL DEL TARGET
+    // ============================
     gGuideState.servoTargetDeg =
       gConfig.home_position_deg + gGuideState.edgeOffsetDeg;
+
+    gGuideState.servoTargetDeg = sanitizeFloatInternal(
+      gGuideState.servoTargetDeg,
+      sStartupHoldDeg,
+      0.0f,
+      gConfig.piston_max_travel_deg
+    );
 
     vTaskDelay(pdMS_TO_TICKS(per));
   }
 }
+
+
 
 // ======================
 // HELPERS PÚBLICOS
@@ -429,6 +525,18 @@ static void guideTask(void *pv) {
 float getServoPositionDeg() { return gServoState.positionDeg; }
 float getServoTargetDeg()   { return gServoState.targetDeg;   }
 float getCurrentA()         { return gServoState.currentA;    }
+
+float getServoPositionDegSafe() {
+  return sanitizeFloatInternal(gServoState.positionDeg, 0.0f, -1000.0f, 1000.0f);
+}
+
+float getServoTargetDegSafe() {
+  return sanitizeFloatInternal(gServoState.targetDeg, 0.0f, -1000.0f, 1000.0f);
+}
+
+float getCurrentASafe() {
+  return sanitizeFloatInternal(gServoState.currentA, 0.0f, -100.0f, 100.0f);
+}
 
 bool getAnyFault() {
   return gServoState.faultOCHard ||
@@ -454,7 +562,11 @@ void setManualMode(bool enabled) {
   if (!enabled) {
     sManualCmd = 0.0f;
     setMotorOutput(0.0f);
+  } else {
+    setValveOutput(false);
+    sOperationEnabled = false;
   }
+
 }
 
 bool getManualMode() {

@@ -4,7 +4,9 @@
 #include <EEPROM.h>
 
 #define EEPROM_SIZE 512
-#define CONFIG_MAGIC 0xDEAD55AA   // Hex válido, no causa errores
+
+// IMPORTANTE: si cambiamos la estructura, cambiá el MAGIC para invalidar EEPROM vieja
+#define CONFIG_MAGIC 0xDEAD56AA   // distinto del anterior para forzar defaults una vez
 
 struct Config {
   uint32_t magic;

@@ -50,6 +50,11 @@ float  getCurrentA();
 bool   getAnyFault();
 String getFaultString();
 
+// Versiones "seguras" para JSON (sanitizadas)
+float  getServoPositionDegSafe();
+float  getServoTargetDegSafe();
+float  getCurrentASafe();
+
 // ---- MODO MANTENIMIENTO / MANUAL ----
 void setManualMode(bool enabled);
 bool getManualMode();

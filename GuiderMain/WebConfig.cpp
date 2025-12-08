@@ -5,6 +5,7 @@
 
 #include "Config.h"
 #include "Control.h"
+#include <math.h>
 
 // --------- CONFIG WIFI AP ---------
 static const char *AP_SSID = "DEPROS-GUIDER";
@@ -47,6 +48,7 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;display:b
 </style>
 </head>
 <body>
+
 <div id="wrap">
 <h1>DEPROS GUIADOR ESP32</h1>
 
@@ -69,6 +71,7 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;display:b
     <canvas id="plot"></canvas>
 
     <h2>Mantenimiento / Control manual</h2>
+
     <div class="switch-row">
       <input type="checkbox" id="manual_mode" onchange="onManualModeChange(this)">
       <label for="manual_mode">Modo manual</label>
@@ -97,42 +100,27 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;display:b
   <div class="col">
     <h2>Configuración</h2>
     <form id="cfgForm">
-      <label>Home (°)
-        <input name="home_position_deg" id="home_position_deg"/>
-      </label>
-      <label>Offset máximo (°)
-        <input name="edge_max_deg" id="edge_max_deg"/>
-      </label>
-      <label>K_EDGE (°/step)
-        <input name="k_edge_deg_per_step" id="k_edge_deg_per_step"/>
-      </label>
-      <label>Recorrido máx. pistón (°)
-        <input name="piston_max_travel_deg" id="piston_max_travel_deg"/>
-      </label>
-      <label>Periodo control borde (ms)
-        <input name="edge_control_period_ms" id="edge_control_period_ms"/>
-      </label>
-      <label>Debounce (ms)
-        <input name="edge_debounce_ms" id="edge_debounce_ms"/>
-      </label>
-      <label>No paper timeout (ms)
-        <input name="no_paper_timeout_ms" id="no_paper_timeout_ms"/>
-      </label>
-      <label>Saturación timeout (ms)
-        <input name="edge_saturation_timeout_ms" id="edge_saturation_timeout_ms"/>
-      </label>
+
+      <label>Home (°)<input name="home_position_deg" id="home_position_deg"></label>
+      <label>Offset máximo (°)<input name="edge_max_deg" id="edge_max_deg"></label>
+      <label>K_EDGE (°/step)<input name="k_edge_deg_per_step" id="k_edge_deg_per_step"></label>
+      <label>Recorrido máx. pistón (°)<input name="piston_max_travel_deg" id="piston_max_travel_deg"></label>
+      <label>Periodo control borde (ms)<input name="edge_control_period_ms" id="edge_control_period_ms"></label>
+      <label>Debounce (ms)<input name="edge_debounce_ms" id="edge_debounce_ms"></label>
+      <label>No paper timeout (ms)<input name="no_paper_timeout_ms" id="no_paper_timeout_ms"></label>
+      <label>Saturación timeout (ms)<input name="edge_saturation_timeout_ms" id="edge_saturation_timeout_ms"></label>
 
       <h3>PID</h3>
-      <label>Kp <input name="pid_kp" id="pid_kp"/></label>
-      <label>Ki <input name="pid_ki" id="pid_ki"/></label>
-      <label>Kd <input name="pid_kd" id="pid_kd"/></label>
-      <label>Counts por grado <input name="counts_per_degree" id="counts_per_degree"/></label>
+      <label>Kp <input name="pid_kp" id="pid_kp"></label>
+      <label>Ki <input name="pid_ki" id="pid_ki"></label>
+      <label>Kd <input name="pid_kd" id="pid_kd"></label>
+      <label>Counts por grado <input name="counts_per_degree" id="counts_per_degree"></label>
 
       <h3>Corriente</h3>
-      <label>Soft limit (A) <input name="soft_current_limitA" id="soft_current_limitA"/></label>
-      <label>Hard limit (A) <input name="hard_current_limitA" id="hard_current_limitA"/></label>
-      <label>ADC offset <input name="current_adc_offset" id="current_adc_offset"/></label>
-      <label>ADC scale (A/count) <input name="current_adc_scale" id="current_adc_scale"/></label>
+      <label>Soft limit (A)<input name="soft_current_limitA" id="soft_current_limitA"></label>
+      <label>Hard limit (A)<input name="hard_current_limitA" id="hard_current_limitA"></label>
+      <label>ADC offset <input name="current_adc_offset" id="current_adc_offset"></label>
+      <label>ADC scale (A/count)<input name="current_adc_scale" id="current_adc_scale"></label>
 
       <button type="button" onclick="sendConfig()">Guardar config</button>
     </form>
@@ -140,6 +128,7 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;display:b
 </div>
 
 </div>
+
 <script>
 let posEl=document.getElementById('pos');
 let tgtEl=document.getElementById('tgt');
@@ -163,6 +152,20 @@ const PLOT_HEIGHT=250;
 let dataTime=[], dataPos=[], dataTgt=[];
 let t0=null;
 
+// =========================
+// CANVAS FIX – DOMContentLoaded
+// =========================
+document.addEventListener("DOMContentLoaded", () => {
+  const canvas = document.getElementById("plot");
+  if (!canvas) return;
+  canvas.width = canvas.clientWidth;
+  canvas.height = PLOT_HEIGHT;
+});
+
+// =========================
+// HELPERS UI
+// =========================
+
 function setDataStatus(text, level='info'){
   let cls='status';
   if(level==='ok') cls+=' badge-ok';
@@ -172,90 +175,131 @@ function setDataStatus(text, level='info'){
   dataStatus.textContent=text;
 }
 
+function safeJsonParse(txt){
+  try{
+    return JSON.parse(txt);
+  }catch(e){
+    console.log("JSON inválido:", txt);
+    setDataStatus("JSON inválido recibido del equipo","err");
+    return null;
+  }
+}
+
 function fetchConfig(){
-  fetch('/config').then(r=>{
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return r.json();
-  }).then(cfg=>{
-    for(let k in cfg){
-      let el=document.getElementById(k);
-      if(el) el.value=cfg[k];
-    }
-  }).catch(e=>{
-    console.log(e);
-    setDataStatus('No se pudo leer configuración ('+e.message+')','warn');
-  });
+  fetch('/config')
+    .then(r=>r.text())
+    .then(txt=>{
+      const cfg = safeJsonParse(txt);
+      if(!cfg) return;
+      for(let k in cfg){
+        let el=document.getElementById(k);
+        if(el) el.value=cfg[k];
+      }
+      setDataStatus("Configuración leída","ok");
+    })
+    .catch(e=>{
+      console.log(e);
+      setDataStatus('No se pudo leer configuración','warn');
+    });
 }
 
 function fetchStatus(){
-  fetch('/status').then(r=>{
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return r.json();
-  }).then(st=>{
-    posEl.textContent=st.pos.toFixed(2);
-    tgtEl.textContent=st.tgt.toFixed(2);
-    curEl.textContent=st.cur.toFixed(2);
-    fltEl.textContent=st.flt;
-    setDataStatus('Datos actualizados','ok');
+  fetch('/status')
+    .then(r=>r.text())
+    .then(txt=>{
+      const st = safeJsonParse(txt);
+      if(!st) return;
 
-    manualModeCheckbox.checked = (st.manual === 1);
-    valveState = st.valve;
-    valveLabel.textContent = st.valve ? 'ON' : 'OFF';
+      posEl.textContent=st.pos.toFixed(2);
+      tgtEl.textContent=st.tgt.toFixed(2);
+      curEl.textContent=st.cur.toFixed(2);
+      fltEl.textContent=st.flt;
 
-    if(st.manual === 1){
-      modeLabel.textContent = 'MANUAL';
-      modeBadge.textContent = 'MANUAL';
-      modeBadge.className='badge badge-warn';
-    }else{
-      modeLabel.textContent = 'AUTO';
-      modeBadge.textContent = 'AUTO';
-      modeBadge.className='badge badge-ok';
-    }
+      manualModeCheckbox.checked = (st.manual === 1);
+      valveState = st.valve;
+      valveLabel.textContent = valveState ? "ON" : "OFF";
 
-    let t=st.t;
-    if(t0===null) t0=t;
-    let tt=(t-t0)/1000.0;
+      if(st.manual === 1){
+        modeLabel.textContent="MANUAL";
+        modeBadge.textContent="MANUAL";
+        modeBadge.className="badge badge-warn";
+      } else {
+        modeLabel.textContent="AUTO";
+        modeBadge.textContent="AUTO";
+        modeBadge.className="badge badge-ok";
+      }
 
-    dataTime.push(tt);
-    dataPos.push(st.pos);
-    dataTgt.push(st.tgt);
-    if(dataTime.length>MAX_POINTS){
-      dataTime.shift(); dataPos.shift(); dataTgt.shift();
-    }
-    drawPlot();
-  }).catch(e=>{
-    console.log(e);
-    setDataStatus('Sin comunicación con el equipo','err');
-  });
+      let t=st.t;
+      if(t0===null) t0=t;
+      let tt=(t-t0)/1000.0;
+
+      dataTime.push(tt);
+      dataPos.push(st.pos);
+      dataTgt.push(st.tgt);
+
+      if(dataTime.length>MAX_POINTS){
+        dataTime.shift();
+        dataPos.shift();
+        dataTgt.shift();
+      }
+
+      drawPlot();
+      setDataStatus("Datos actualizados","ok");
+    })
+    .catch(e=>{
+      console.log(e);
+      setDataStatus("Sin comunicación con el equipo","err");
+    });
 }
 
 function fetchIOStatus(){
-  fetch('/io_status').then(r=>r.json()).then(io=>{
-    setIoPill(ioOptL, io.optL);
-    setIoPill(ioOptR, io.optR);
-    setIoPill(ioLimit, io.limitMag);
-    setIoPill(ioButton, io.button);
-    valveState = io.valve;
-    valveLabel.textContent = io.valve ? 'ON' : 'OFF';
-    manualModeCheckbox.checked = (io.manual === 1);
-  }).catch(e=>console.log(e));
+  fetch('/io_status')
+    .then(r=>r.text())
+    .then(txt=>{
+      const io = safeJsonParse(txt);
+      if(!io) return;
+      setIoPill(ioOptL, io.optL);
+      setIoPill(ioOptR, io.optR);
+      setIoPill(ioLimit, io.limitMag);
+      setIoPill(ioButton, io.button);
+      valveState = io.valve;
+      valveLabel.textContent = valveState ? "ON" : "OFF";
+      manualModeCheckbox.checked = (io.manual === 1);
+    })
+    .catch(e=>console.log(e));
 }
 
 function setIoPill(elem, on){
   if(on){
-    elem.classList.remove('io-off');
     elem.classList.add('io-on');
-  }else{
-    elem.classList.remove('io-on');
+    elem.classList.remove('io-off');
+  } else {
     elem.classList.add('io-off');
+    elem.classList.remove('io-on');
   }
+}
+
+// =========================
+// PLOT
+// =========================
+
+function resizePlot(){
+  let canvas=document.getElementById('plot');
+  if(!canvas) return;
+  const w = canvas.clientWidth;
+  if(w > 0) canvas.width = w;
+  canvas.height = PLOT_HEIGHT;
+  drawPlot();
 }
 
 function drawPlot(){
   let canvas=document.getElementById('plot');
+  if(!canvas) return;
   let ctx=canvas.getContext('2d');
   let w=canvas.width, h=canvas.height;
+
   ctx.clearRect(0,0,w,h);
+
   if(dataTime.length<2){
     ctx.fillStyle='#777';
     ctx.font='14px Arial';
@@ -263,57 +307,69 @@ function drawPlot(){
     return;
   }
 
-  let tmin=dataTime[0], tmax=dataTime[dataTime.length-1];
+  let tmin=dataTime[0];
+  let tmax=dataTime[dataTime.length-1];
   let ymin=Math.min(...dataPos, ...dataTgt);
   let ymax=Math.max(...dataPos, ...dataTgt);
+
   if(ymax-ymin<1){ ymax+=0.5; ymin-=0.5; }
 
-  function tx(t){ return 10+(t-tmin)/(tmax-tmin)*(w-20); }
-  function ty(y){ return h-10-(y-ymin)/(ymax-ymin)*(h-20); }
+  function tx(t){ return 10 + (t-tmin)/(tmax-tmin) * (w-20); }
+  function ty(y){ return h-10 - (y-ymin)/(ymax-ymin) * (h-20); }
 
   ctx.strokeStyle='#ccc';
   ctx.beginPath();
-  ctx.moveTo(10,10); ctx.lineTo(10,h-10); ctx.lineTo(w-10,h-10);
+  ctx.moveTo(10,10);
+  ctx.lineTo(10,h-10);
+  ctx.lineTo(w-10,h-10);
   ctx.stroke();
 
   ctx.strokeStyle='red';
   ctx.beginPath();
   ctx.moveTo(tx(dataTime[0]), ty(dataTgt[0]));
-  for(let i=1;i<dataTime.length;i++) ctx.lineTo(tx(dataTime[i]), ty(dataTgt[i]));
+  for(let i=1;i<dataTime.length;i++){
+    ctx.lineTo(tx(dataTime[i]), ty(dataTgt[i]));
+  }
   ctx.stroke();
 
   ctx.strokeStyle='blue';
   ctx.beginPath();
   ctx.moveTo(tx(dataTime[0]), ty(dataPos[0]));
-  for(let i=1;i<dataTime.length;i++) ctx.lineTo(tx(dataTime[i]), ty(dataPos[i]));
+  for(let i=1;i<dataTime.length;i++){
+    ctx.lineTo(tx(dataTime[i]), ty(dataPos[i]));
+  }
   ctx.stroke();
 }
 
-function resizePlot(){
-  let canvas=document.getElementById('plot');
-  canvas.width=canvas.clientWidth;
-  canvas.height=PLOT_HEIGHT;
-  drawPlot();
-}
+// =========================
+// SET CONFIG
+// =========================
 
 function sendConfig(){
   let form=document.getElementById('cfgForm');
   let params=new URLSearchParams();
+
   for(let i=0;i<form.elements.length;i++){
     let e=form.elements[i];
     if(e.name) params.append(e.name, e.value);
   }
+
   fetch('/setConfig',{method:'POST',body:params})
-    .then(r=>r.text()).then(t=>console.log('cfg resp',t))
+    .then(r=>r.text())
+    .then(t=>console.log("cfg resp",t))
     .catch(e=>console.log(e));
 }
 
+// =========================
+// MANUAL MODE
+// =========================
+
 function onManualModeChange(chk){
-  let mode = chk.checked ? '1' : '0';
   let params=new URLSearchParams();
-  params.append('mode', mode);
+  params.append('mode', chk.checked ? "1" : "0");
   fetch('/manual',{method:'POST',body:params})
-    .then(r=>r.text()).then(t=>console.log('manual mode resp',t))
+    .then(r=>r.text())
+    .then(t=>console.log("manual mode resp",t))
     .catch(e=>console.log(e));
 }
 
@@ -321,30 +377,43 @@ function sendManualCmd(cmd){
   let params=new URLSearchParams();
   params.append('cmd', cmd);
   fetch('/manual',{method:'POST',body:params})
-    .then(r=>r.text()).then(t=>console.log('manual cmd resp',t))
+    .then(r=>r.text())
+    .then(t=>console.log("manual cmd resp",t))
     .catch(e=>console.log(e));
 }
+
+// =========================
+// VÁLVULA
+// =========================
 
 function toggleValve(){
   let newState = valveState ? 0 : 1;
+  valveState = newState;
+
   let params=new URLSearchParams();
   params.append('state', newState.toString());
+
   fetch('/valve',{method:'POST',body:params})
-    .then(r=>r.text()).then(t=>{
-      console.log('valve resp',t);
-      valveState = newState;
-      valveLabel.textContent = valveState ? 'ON' : 'OFF';
-    })
+    .then(r=>r.text())
+    .then(t=>console.log("valve resp",t))
     .catch(e=>console.log(e));
 }
 
+// =========================
+// ONLOAD CON RETRASO
+// =========================
+
 window.onload=function(){
-  resizePlot();
-  fetchConfig();
-  setInterval(fetchStatus,200);
-  setInterval(fetchIOStatus,300);
+  setTimeout(() => {
+    resizePlot();
+    fetchConfig();
+    setInterval(fetchStatus, 300);
+    setInterval(fetchIOStatus, 500);
+  }, 800);
 };
+
 window.addEventListener('resize', resizePlot);
+
 </script>
 </body>
 </html>
@@ -372,11 +441,16 @@ static void handleRoot() {
 }
 
 static void handleStatus() {
+  // Usamos las versiones "safe" que nunca devuelven NaN/Inf
+  float pos = getServoPositionDegSafe();
+  float tgt = getServoTargetDegSafe();
+  float cur = getCurrentASafe();
+
   String json = "{";
   json += "\"t\":"   + String(millis()) + ",";
-  json += "\"pos\":" + String(getServoPositionDeg(),3) + ",";
-  json += "\"tgt\":" + String(getServoTargetDeg(),3) + ",";
-  json += "\"cur\":" + String(getCurrentA(),3) + ",";
+  json += "\"pos\":" + String(pos,3) + ",";
+  json += "\"tgt\":" + String(tgt,3) + ",";
+  json += "\"cur\":" + String(cur,3) + ",";
   json += "\"flt\":\"" + getFaultString() + "\",";
   json += "\"manual\":" + String(getManualMode() ? 1 : 0) + ",";
   json += "\"valve\":"  + String(getValveOutput() ? 1 : 0);
@@ -389,7 +463,7 @@ static void handleConfigGet() {
   json += "\"home_position_deg\":"          + String(gConfig.home_position_deg)          + ",";
   json += "\"edge_max_deg\":"               + String(gConfig.edge_max_deg)               + ",";
   json += "\"k_edge_deg_per_step\":"        + String(gConfig.k_edge_deg_per_step)        + ",";
-  json += "\"piston_max_travel_deg\":"       + String(gConfig.piston_max_travel_deg)       + ",";
+  json += "\"piston_max_travel_deg\":"      + String(gConfig.piston_max_travel_deg)      + ",";
   json += "\"edge_control_period_ms\":"     + String(gConfig.edge_control_period_ms)     + ",";
   json += "\"edge_debounce_ms\":"           + String(gConfig.edge_debounce_ms)           + ",";
   json += "\"no_paper_timeout_ms\":"        + String(gConfig.no_paper_timeout_ms)        + ",";
@@ -410,7 +484,7 @@ static void handleConfigPost() {
   gConfig.home_position_deg          = getArgFloat("home_position_deg",          gConfig.home_position_deg);
   gConfig.edge_max_deg               = getArgFloat("edge_max_deg",               gConfig.edge_max_deg);
   gConfig.k_edge_deg_per_step        = getArgFloat("k_edge_deg_per_step",        gConfig.k_edge_deg_per_step);
-  gConfig.piston_max_travel_deg       = getArgFloat("piston_max_travel_deg",       gConfig.piston_max_travel_deg);
+  gConfig.piston_max_travel_deg      = getArgFloat("piston_max_travel_deg",      gConfig.piston_max_travel_deg);
   gConfig.edge_control_period_ms     = getArgU32 ("edge_control_period_ms",      gConfig.edge_control_period_ms);
   gConfig.edge_debounce_ms           = getArgU32 ("edge_debounce_ms",            gConfig.edge_debounce_ms);
   gConfig.no_paper_timeout_ms        = getArgU32 ("no_paper_timeout_ms",         gConfig.no_paper_timeout_ms);
@@ -484,6 +558,7 @@ static void handleNotFound() {
 
 void initWiFiAndWeb() {
   WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);   // evita cortes de WiFi en AP
   WiFi.softAP(AP_SSID, AP_PASS);
 
   IPAddress ip = WiFi.softAPIP();

@@ -34,5 +34,6 @@ void loop() {
   webLoop();
 
   // Cede CPU al scheduler / WDT core 1
-  delay(2);
+  delay(1);
+  yield();
 }
