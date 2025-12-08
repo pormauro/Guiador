@@ -1,32 +1,40 @@
-// File: Pins.h
 #pragma once
 #include <Arduino.h>
 
-// === BTS7960 DRIVER 43A ===
-#define PIN_RPWM   18
-#define PIN_LPWM   19
-#define PIN_REN    21
-#define PIN_LEN    22
+// =========================
+// ENCODER
+// =========================
+#define PIN_ENC_A        16
+#define PIN_ENC_B        17
+// (Elegidos entre: 5,17,16,4,0,2,15 → solo 16 y 17 sirven sin problemas)
 
-// === ENCODER ===
-#define PIN_ENC_A  25
-#define PIN_ENC_B  26
+// =========================
+// BTS7960 DRIVER
+// =========================
+#define PIN_RPWM         32
+#define PIN_LPWM         33
+#define PIN_REN          25
+#define PIN_LEN          26
 
-// === SENSOR CORRIENTE ===
-#define PIN_CURRENT_ADC 34
+// =========================
+// SENSOR DE CORRIENTE (ADC1)
+// =========================
+#define PIN_CURRENT_ADC  35   // Solo entrada → perfecto para sensor
 
-// === SENSORES OPTICOS ===
-#define PIN_OPT_LEFT  14
-#define PIN_OPT_RIGHT 12
+// =========================
+// ENTRADAS OPTICAS + BOTON
+// =========================
+#define PIN_OPT_LEFT     18   // L
+#define PIN_OPT_RIGHT    19   // R
+#define PIN_LIMIT_MAG    21   // Final de carrera
+#define PIN_BUTTON       22   // Botón
 
-// === FINAL DE CARRERA MAGNÉTICO ===
-#define PIN_LIMIT_MAG 27
+// =========================
+// SALIDA VALVULA/RELE
+// =========================
+#define PIN_VALVE_OUT    23   // 34 NO sirve → SOLO ENTRADA
 
-// === VÁLVULA ===
-#define PIN_VALVE_OUT 23
-
-// === BOTÓN LOCAL ===
-#define PIN_BUTTON 13
-
-// === LED STATUS ===
-#define PIN_LED_STATUS 2
+// =========================
+// LED STATUS
+// =========================
+#define PIN_LED_STATUS    2   // Cuidado: mantiene requerimientos de boot
