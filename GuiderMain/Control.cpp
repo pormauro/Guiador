@@ -193,11 +193,11 @@ static void setMotorOutput(float u) {
 
   if (u > 0) {
     digitalWrite(PIN_REN, HIGH);
-    digitalWrite(PIN_LEN, LOW);
+    digitalWrite(PIN_LEN, HIGH);
     analogWrite(PIN_RPWM, pwm);
     analogWrite(PIN_LPWM, 0);
   } else {
-    digitalWrite(PIN_REN, LOW);
+    digitalWrite(PIN_REN, HIGH);
     digitalWrite(PIN_LEN, HIGH);
     analogWrite(PIN_RPWM, 0);
     analogWrite(PIN_LPWM, pwm);
