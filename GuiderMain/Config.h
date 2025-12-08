@@ -18,6 +18,9 @@ struct Config {
   uint32_t no_paper_timeout_ms;
   uint32_t edge_saturation_timeout_ms;
 
+  // Manual
+  float    manual_speed_scale;   // 0..1 factor para el PWM en manual
+
   // PID
   float pid_kp;
   float pid_ki;

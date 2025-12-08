@@ -235,7 +235,8 @@ static void setMotorOutput(float u) {
     }
 
     // Ignora todos los demás faults en modo manual.
-    u = constrain(u, -1.0f, 1.0f);
+    float scale = constrain(gConfig.manual_speed_scale, 0.0f, 1.0f);
+    u = constrain(u, -1.0f, 1.0f) * scale;
     uint16_t duty = (uint16_t)(fabs(u) * PWM_MAX);
 
     if (fabs(u) < 0.01f) {
