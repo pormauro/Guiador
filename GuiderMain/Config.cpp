@@ -24,6 +24,9 @@ void setDefaultConfig() {
   gConfig.no_paper_timeout_ms        = 300;
   gConfig.edge_saturation_timeout_ms = 2000;
 
+  // Manual
+  gConfig.manual_speed_scale         = 0.5f;
+
   // PID
   gConfig.pid_kp = 2.0f;
   gConfig.pid_ki = 0.5f;
@@ -46,6 +49,12 @@ void loadConfig() {
   if (gConfig.magic != CONFIG_MAGIC) {
     setDefaultConfig();
     saveConfig();
+    return;
+  }
+
+  // Sanitizar nuevos campos añadidos en versiones anteriores
+  if (gConfig.manual_speed_scale <= 0.0f || gConfig.manual_speed_scale > 1.0f) {
+    gConfig.manual_speed_scale = 0.5f;
   }
 }
 

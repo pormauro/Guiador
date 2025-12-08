@@ -137,6 +137,11 @@ canvas{width:100%;height:250px;border:1px solid #ccc;border-radius:4px;}
         <input name="edge_saturation_timeout_ms" id="edge_saturation_timeout_ms"/>
       </label>
 
+      <h3>Manual</h3>
+      <label>Escala velocidad manual (0-1)
+        <input name="manual_speed_scale" id="manual_speed_scale"/>
+      </label>
+
       <h3>PID</h3>
       <label>Kp <input name="pid_kp" id="pid_kp"/></label>
       <label>Ki <input name="pid_ki" id="pid_ki"/></label>
@@ -425,6 +430,7 @@ static void handleConfigGet() {
   json += "\"edge_debounce_ms\":"           + String(gConfig.edge_debounce_ms)           + ",";
   json += "\"no_paper_timeout_ms\":"        + String(gConfig.no_paper_timeout_ms)        + ",";
   json += "\"edge_saturation_timeout_ms\":" + String(gConfig.edge_saturation_timeout_ms) + ",";
+  json += "\"manual_speed_scale\":"         + String(gConfig.manual_speed_scale)         + ",";
   json += "\"pid_kp\":"                     + String(gConfig.pid_kp)                     + ",";
   json += "\"pid_ki\":"                     + String(gConfig.pid_ki)                     + ",";
   json += "\"pid_kd\":"                     + String(gConfig.pid_kd)                     + ",";
@@ -445,6 +451,7 @@ static void handleConfigPost() {
   gConfig.edge_debounce_ms           = getArgU32 ("edge_debounce_ms",            gConfig.edge_debounce_ms);
   gConfig.no_paper_timeout_ms        = getArgU32 ("no_paper_timeout_ms",         gConfig.no_paper_timeout_ms);
   gConfig.edge_saturation_timeout_ms = getArgU32 ("edge_saturation_timeout_ms",  gConfig.edge_saturation_timeout_ms);
+  gConfig.manual_speed_scale         = getArgFloat("manual_speed_scale",         gConfig.manual_speed_scale);
 
   gConfig.pid_kp                     = getArgFloat("pid_kp",                     gConfig.pid_kp);
   gConfig.pid_ki                     = getArgFloat("pid_ki",                     gConfig.pid_ki);
